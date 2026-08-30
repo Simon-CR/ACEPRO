@@ -150,6 +150,15 @@ def read_ace_config(config):
     ace_config["extruder_feeding_speed"] = config.getint("extruder_feeding_speed", 5)
     ace_config["timeout_multiplier"] = config.getint("timeout_multiplier", 2)
     ace_config["default_color_change_purge_length"] = config.getint("default_color_change_purge_length", "50")
+    # Runout-swap bite: tandem distance closing most of entry->gears while the
+    # stub's tail is STILL GRIPPED by the extruder (no empty-nip spinning).
+    ace_config["runout_bite_length"] = config.getfloat("runout_bite_length", 12.0)
+    # Extruder-only push under assist after the bite: the lane's spring buffer
+    # presses the free head against the receding tail (Simon's 2-4mm hug).
+    ace_config["runout_hug_length"] = config.getfloat("runout_hug_length", 4.0)
+    # Verification purge after a runout swap: drives the hub-encoder handoff
+    # check, carries the brush wipe, restores pressure. The stub prints.
+    ace_config["runout_swap_purge_length"] = config.getfloat("runout_swap_purge_length", 10.0)
     ace_config["default_color_change_purge_speed"] = config.getint("default_color_change_purge_speed", "400")
     ace_config["purge_max_chunk_length"] = config.getint("purge_max_chunk_length", "300")
     ace_config["purge_multiplier"] = config.getfloat("purge_multiplier", "1.0")
@@ -250,6 +259,8 @@ def read_ace_config(config):
     ace_config["toolchange_load_length"] = config.get("toolchange_load_length", "3000")
     ace_config["incremental_feeding_length"] = config.get("incremental_feeding_length", "50")
     ace_config["incremental_feeding_speed"] = config.get("incremental_feeding_speed", "30")
+    ace_config["entry_to_gear_mm"] = config.get("entry_to_gear_mm", "12")
+    ace_config["seat_verify_sensor"] = config.get("seat_verify_sensor", "")
     ace_config["heartbeat_interval"] = config.get("heartbeat_interval", "1.0")
     ace_config["max_dryer_temperature"] = config.get("max_dryer_temperature", "60")
 

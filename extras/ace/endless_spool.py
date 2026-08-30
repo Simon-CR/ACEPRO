@@ -11,12 +11,23 @@ Integration:
 """
 
 import logging
+import re
 from .config import (
     ACE_INSTANCES,
     SLOTS_PER_ACE,
     get_instance_from_tool,
     get_local_slot,
 )
+
+
+# Polymer family from a vendor label: strip at the first non-alphanumeric character.
+# PLA+ / PLA-HF / PLA Silk -> PLA; PETG stays PETG. Same rule as ace_mmu_shim._family and
+# the purge-scaling logic, so all three agree on what "same material" means.
+_FAMILY_TRIM = re.compile(r"[^A-Za-z0-9].*$")
+
+
+def _material_family(label):
+    return _FAMILY_TRIM.sub("", str(label or "").strip().upper())
 
 
 class EndlessSpool:
@@ -136,7 +147,20 @@ class EndlessSpool:
                 )
                 continue
 
-            if cand_material != current_material:
+            # MODE=material means "same polymer", not "same vendor label". An exact string
+            # compare here made PLA and PLA+ mutually unmatchable even though they are the
+            # same polymer at the same temperature, which is precisely the swap the mode
+            # exists to allow (2026-08-26). MODE=exact keeps the strict compare.
+            if match_mode == "material":
+                if _material_family(cand_material) != _material_family(current_material):
+                    logging.info(
+                        f"ACE: T{candidate_tool} skipped - material family mismatch "
+                        f"(want '{_material_family(current_material)}' from "
+                        f"'{current_material}', got '{_material_family(cand_material)}' "
+                        f"from '{cand_material}')"
+                    )
+                    continue
+            elif cand_material != current_material:
                 logging.info(
                     f"ACE: T{candidate_tool} skipped - material mismatch "
                     f"(want '{current_material}', got '{cand_material}')"
@@ -173,6 +197,46 @@ class EndlessSpool:
             )
         return -1
 
+    def list_candidates(self, current_tool):
+        """Ready lanes that could take over after a runout on current_tool.
+
+        Returns [(tool, material, color, exact)] in wrap-around search order.
+        exact = same material AND colour as the runout lane. Unknown-material
+        lanes are excluded, same safety rule as find_exact_match.
+        """
+        inst_num = get_instance_from_tool(current_tool)
+        local_slot = get_local_slot(current_tool, inst_num)
+        if inst_num < 0 or local_slot < 0:
+            return []
+        ace_inst = ACE_INSTANCES.get(inst_num)
+        if not ace_inst:
+            return []
+        cur_inv = ace_inst.inventory[local_slot]
+        cur_mat = cur_inv.get("material", "").lower().strip()
+        cur_color = cur_inv.get("color", [0, 0, 0])
+        total_tools = len(ACE_INSTANCES) * SLOTS_PER_ACE
+        out = []
+        for offset in range(1, total_tools):
+            t = (current_tool + offset) % total_tools
+            i_num = get_instance_from_tool(t)
+            i_slot = get_local_slot(t, i_num)
+            if i_num < 0 or i_slot < 0:
+                continue
+            inst = ACE_INSTANCES.get(i_num)
+            if not inst:
+                continue
+            inv = inst.inventory[i_slot]
+            if inv.get("status") != "ready":
+                continue
+            mat = inv.get("material", "").lower().strip()
+            if mat == "unknown":
+                continue
+            color = inv.get("color", [0, 0, 0])
+            exact = (cur_mat != "unknown" and mat == cur_mat
+                     and color == cur_color)
+            out.append((t, inv.get("material", "?"), color, exact))
+        return out
+
     def execute_swap(self, from_tool, to_tool):
         """
         Execute endless spool swap with intelligent fallback.
@@ -208,6 +272,19 @@ class EndlessSpool:
                     status = self.manager.perform_tool_change(from_tool, current_target_tool, is_endless_spool=True)
                     self.gcode.respond_info(f"ACE: {status}")
 
+                    # Consumed-spool housekeeping: hand the emptied gate to the
+                    # config layer (unbind, backend notes). Optional hook.
+                    try:
+                        if self.printer.lookup_object(
+                                "gcode_macro _ACE_RUNOUT_CONSUMED", None) is not None:
+                            self.gcode.run_script_from_command(
+                                f"_ACE_RUNOUT_CONSUMED GATE={from_tool}"
+                            )
+                    except Exception as hook_err:
+                        self.gcode.respond_info(
+                            f"ACE: Consumed-spool hook failed: {hook_err}"
+                        )
+
                     self.gcode.respond_info("ACE: Resuming print")
                     self.manager.gcode.run_script_from_command("RESUME PURGE=0")
 
@@ -225,7 +302,7 @@ class EndlessSpool:
                     tried_tools.add(current_target_tool)
 
                     self.gcode.respond_info(
-                        f"ACE: Attempting recovery - smart unload T{current_target_tool}..."
+                        f"ACE: Attempting recovery - parking T{current_target_tool}..."
                     )
 
                     try:
@@ -233,15 +310,11 @@ class EndlessSpool:
                         to_slot = get_local_slot(current_target_tool, to_inst_num)
 
                         if to_inst_num >= 0 and to_slot >= 0:
-                            ace_inst = self.manager.instances[to_inst_num]
-                            ace_inst._smart_unload_slot(
-                                to_slot,
-                                length=ace_inst.parkposition_to_toolhead_length,
+                            # Park, never eject: the fixed-length unload backed a lane
+                            # that had not left its feeder out of the slot (2026-08-26).
+                            self.gcode.run_script_from_command(
+                                f"_ACE_RECOVERY_PARK T={current_target_tool}"
                             )
-
-                            ace_inst.inventory[to_slot]["status"] = "empty"
-                            self.manager._sync_inventory_to_persistent(to_inst_num, flush=False)
-                            self.gcode.respond_info(f"ACE: Marked T{current_target_tool} as empty (failed swap)")
 
                     except Exception as unload_error:
                         self.gcode.respond_info(
@@ -282,6 +355,15 @@ class EndlessSpool:
                     current_target_tool = next_tool
 
         except Exception as e:
+            # LIFT FIRST, before anything else and before the prompt. By this point the
+            # purge's RESTORE_GCODE_STATE has usually put the nozzle back over the part at
+            # layer height, so whatever failed, leaving it there bakes the print while the
+            # user reads the message. Swallow errors: a failure to park must never mask the
+            # real exception below.
+            try:
+                self.gcode.run_script_from_command("_TOOLHEAD_PARK_PAUSE_CANCEL")
+            except Exception:
+                logging.exception("ACE: could not park the toolhead after a failed swap")
             self.gcode.respond_info("ACE: *** ENDLESS SPOOL SWAP FAILED ***")
             self.gcode.respond_info(f"ACE: {e}")
             self.gcode.respond_info("ACE: Print is PAUSED - fix the issue and RESUME manually")

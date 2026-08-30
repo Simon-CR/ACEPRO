@@ -50,6 +50,20 @@ class AceInstance:
     # stale error from a previous attempt (the feed command clears it on the
     # device). Firmware needs ~16-18s to declare an error, so 2s loses nothing.
     FEED_ERROR_GRACE_S = 2.0
+    # A slot error must survive one full heartbeat refresh (1Hz) before it aborts a
+    # load: the status cache can still hold the PREVIOUS attempt's gear_err when the
+    # grace check first looks, and a single stale frame killed two healthy loads on
+    # 2026-08-22. A real fault persists; a stale one is overwritten by the next beat.
+    FEED_ERROR_CONFIRM_S = 1.2
+
+    # Back-off to the entry sensor's release edge after the approach feed stops.
+    # Chunked under the lane buffer's ~3mm travel, same rationale as the eject.
+    RELEASE_CHUNK_MM = 2.0
+    RELEASE_BACKOFF_SPEED = 20.0
+    # Measured healthy back-off is ~34mm: ~10mm of buffer relax (ACE-side retraction
+    # that moves no tip) + stop overshoot + hysteresis. Not releasing within this
+    # means the filament is not actually moving back.
+    RELEASE_BACKOFF_CAP_MM = 60.0
 
     # Material temperature defaults (from RFID tags)
     MATERIAL_TEMPS = {
@@ -117,6 +131,11 @@ class AceInstance:
         self.incremental_feeding_speed = float(ace_config["incremental_feeding_speed"])
         self.extruder_feeding_length = float(ace_config["extruder_feeding_length"])
         self.extruder_feeding_speed = float(ace_config["extruder_feeding_speed"])
+        self.runout_bite_length = float(ace_config["runout_bite_length"])
+        self.runout_hug_length = float(ace_config["runout_hug_length"])
+        self._stub_load_completed = False
+        self.entry_to_gear_mm = float(ace_config.get("entry_to_gear_mm", 12.0))
+        self.seat_verify_sensor = (ace_config.get("seat_verify_sensor") or "").strip()
         self.toolhead_slow_loading_speed = float(ace_config["toolhead_slow_loading_speed"])
         self.heartbeat_interval = float(ace_config["heartbeat_interval"])
         self.max_dryer_temperature = float(ace_config["max_dryer_temperature"])
@@ -141,6 +160,12 @@ class AceInstance:
         self._device_status_seen = False
         self.inventory = create_inventory(self.SLOT_COUNT)
         self._feed_assist_index = -1
+        self.last_load_parked = False
+        # Slot with a load in flight. ace_current_index only flips at load END, so the
+        # single-assist invariant below would read the incoming lane's assist as stale
+        # and destroy it mid-load (2026-08-22: cleared during T3's load; the purge then
+        # drove the extruder against a static ACE and ground the filament).
+        self._loading_slot = -1
         self._feed_assist_topology_position = None  # Track chain position (0, 1, 2...)
         self._pending_feed_assist_restore = -1  # Slot to restore after first heartbeat
         self._feed_assist_restore_attempts = 0  # Retry counter for busy-deferred restores
@@ -568,6 +593,10 @@ class AceInstance:
 
     def _enable_feed_assist(self, slot_index):
         """Enable feed assist for smooth filament loading."""
+        # Captured BEFORE the assignment below overwrites it: on ACE2 an assist that is
+        # already running is itself what holds the device 'busy', so the leading
+        # wait_ready() must not wait on it. See the guard below.
+        _already_assisting = (self._feed_assist_index == slot_index)
         self._feed_assist_index = slot_index
         self._feed_assist_topology_position = self.serial_mgr.get_usb_topology_position()
 
@@ -586,7 +615,13 @@ class AceInstance:
                     f"ACE[{self.instance_num}]: Feed assist enable failed: {msg}"
                 )
 
-        self.wait_ready()
+        # Re-arming assist on a slot that is ALREADY assisting deadlocks on ACE2: the
+        # device is busy because of that assist and cannot return to 'ready' until it is
+        # stopped, so this wait burned its full 60s and raised (2026-08-26, twice, both
+        # during _BRUSH_PRIME). The trailing wait_ready() below was guarded for precisely
+        # this reason; this one was missed. Every other path still waits.
+        if not (_already_assisting and self.protocol.feed_assist_causes_busy()):
+            self.wait_ready()
         request = self.protocol.build_start_feed_assist_request(slot_index)
         self.send_request(request, callback)
         # ACE1: stays 'ready' during feed assist, so wait confirms the command was processed.
@@ -702,6 +737,254 @@ class AceInstance:
         request = self.protocol.build_stop_feed_filament_request(slot)
         self.send_high_prio_request(request, callback)
 
+    def _retract_async(self, slot, length, speed):
+        """Fire-and-forget retract: send the device command and return immediately, so
+        gcode issued right after (a FORCE_MOVE) runs WHILE the ACE winds. The blocking
+        _retract serialised the park's 'simultaneous' pull into one end after the other
+        (observed 04:53-04:54 on 2026-08-23); both ends must genuinely move together.
+        """
+        self._ensure_feed_assist_off_for_motion(slot, "retract")
+        if self._is_slot_empty(slot):
+            self.gcode.respond_info(
+                f"ACE[{self.instance_num}]: Async retract skipped - slot {slot} is empty"
+            )
+            return
+
+        def callback(response):
+            if response and (response.get("code", 0) != 0
+                             or response.get("msg") == "FORBIDDEN"):
+                self.gcode.respond_info(
+                    f"ACE[{self.instance_num}]: Async retract rejected: "
+                    f"{response.get('msg', 'no message')}"
+                )
+
+        request = self.protocol.build_unwind_filament_request(slot, length, speed)
+        self.send_request(request, callback)
+
+    # Any STOP_FEED_OR_ROLLBACK leaves the device rejecting motion for ~20-30s.
+    # All three 'stop' builders emit that identical opcode-9 frame - stopping assist,
+    # stopping a feed and stopping an unwind are the SAME command on the wire - so any
+    # of them arms the window. The verified starters below retry on FORBIDDEN with a 1s
+    # pause, which makes the attempt budget the effective timeout: it must exceed the
+    # window or a caller that just stopped anything gets a spurious hard refusal.
+    # Costs nothing in the normal case - acceptance returns on the first attempt.
+    STOP_SETTLE_ATTEMPTS = 35
+
+    def _retract_async_verified(self, slot, length, speed, max_attempts=None):
+        """Start an async retract and return only once the device has ACCEPTED it.
+
+        _retract_async fire-and-forgets: a FORBIDDEN lands in a log callback and the caller
+        never knows. For a tandem pull that is fatal - the extruder then pulls alone against
+        a clamped lane (2026-08-27: 140mm of exactly that killed a toolchange mid-print).
+        This uses the blocking _retract's own acceptance machinery, but returns as soon as
+        the device says yes, so the pull itself still runs concurrently with the extruder.
+        Raises instead of returning when the device keeps refusing - the caller must NOT
+        move the extruder in that case.
+        """
+        if max_attempts is None:
+            max_attempts = self.STOP_SETTLE_ATTEMPTS
+        self._ensure_feed_assist_off_for_motion(slot, "retract")
+        if self._is_slot_empty(slot):
+            raise ValueError(
+                f"ACE[{self.instance_num}]: tandem retract refused - slot {slot} is empty")
+        request = self.protocol.build_unwind_filament_request(slot, length, speed)
+        why = "unknown"
+        for attempt in range(1, max_attempts + 1):
+            rc = {"response": None, "done": False}
+
+            def callback(response, rc=rc):
+                rc["response"] = response
+                rc["done"] = True
+
+            self.send_request(request, callback)
+            deadline = time.time() + 3.0
+            while not rc["done"] and time.time() < deadline:
+                self.reactor.pause(self.reactor.monotonic() + 0.1)
+            resp = rc["response"]
+            if resp and resp.get("code", 0) == 0 and resp.get("msg") != "FORBIDDEN":
+                return
+            why = "no response" if not resp else resp.get("msg", "error")
+            self.gcode.respond_info(
+                f"ACE[{self.instance_num}]: tandem retract not accepted "
+                f"(attempt {attempt}/{max_attempts}: {why}) - extruder held still")
+            self.reactor.pause(self.reactor.monotonic() + 1.0)
+        raise ValueError(
+            f"ACE[{self.instance_num}]: device refused the tandem retract {max_attempts}x "
+            f"({why}) - aborting BEFORE the extruder pulls against a clamped lane")
+
+    def _start_rollback_assist_verified(self, slot, length=3000., speed=40.,
+                                        max_attempts=None):
+        """Start mode-3 ROLLBACK ASSIST and return only once the device has ACCEPTED it.
+
+        Same contract as _retract_async_verified, for the same reason: a FORBIDDEN that lands in
+        a log callback is invisible to the caller, and the caller would then move the extruder
+        against a lane that is not participating. Raises rather than returning on refusal.
+
+        Mode 3 differs from a mode-1 unwind in the way that matters here: the ACE decides when to
+        move from BUFFER TENSION rather than running a commanded distance, so the extruder sets
+        the pace and the two ends cannot drift out of sync. That hand-synchronisation is the
+        entire failure mode of a driven tandem pull. The firmware clamps the assist to ~50 mm/s
+        internally, so extruder retraction must stay below that or the extruder outruns the ACE.
+        """
+        if max_attempts is None:
+            max_attempts = self.STOP_SETTLE_ATTEMPTS
+        self._ensure_feed_assist_off_for_motion(slot, "rollback assist")
+        if self._is_slot_empty(slot):
+            raise ValueError(
+                "ACE[%d]: rollback assist refused - slot %d is empty"
+                % (self.instance_num, slot))
+        request = self.protocol.build_start_rollback_assist_request(slot, length, speed)
+        why = "unknown"
+        for attempt in range(1, max_attempts + 1):
+            rc = {"response": None, "done": False}
+
+            def callback(response, rc=rc):
+                rc["response"] = response
+                rc["done"] = True
+
+            self.send_request(request, callback)
+            deadline = time.time() + 3.0
+            while not rc["done"] and time.time() < deadline:
+                self.reactor.pause(self.reactor.monotonic() + 0.1)
+            resp = rc["response"]
+            if resp and resp.get("code", 0) == 0 and resp.get("msg") != "FORBIDDEN":
+                return
+            why = "no response" if not resp else resp.get("msg", "error")
+            self.gcode.respond_info(
+                "ACE[%d]: rollback assist not accepted (attempt %d/%d: %s) - extruder held still"
+                % (self.instance_num, attempt, max_attempts, why))
+            self.reactor.pause(self.reactor.monotonic() + 1.0)
+        raise ValueError(
+            "ACE[%d]: device refused rollback assist %dx (%s) - aborting BEFORE the extruder "
+            "pulls against a lane that is not assisting" % (self.instance_num, max_attempts, why))
+
+    def _stop_rollback_assist(self, slot):
+        """End mode-3 assist. Uses the shared STOP; callers must respect the ~20-30s window in
+        which the device rejects further motion after a STOP_FEED_OR_ROLLBACK."""
+        try:
+            request = self.protocol.build_stop_rollback_assist_request(slot)
+            self.send_request(request, lambda r: None)
+        except Exception:
+            logging.exception("ace: stop rollback assist failed")
+
+    def _tandem_extract(self, slot, speed, cap_mm):
+        """Reverse of the load crossing: both ends pull at the same speed only until
+        the entry sensor CLEARS -- past that point the extruder no longer touches the
+        filament, and the long pull home belongs to the ACE alone. Sensor-terminated
+        because the required distance varies with where the tip parked; cap_mm is the
+        jam guard, not the target.
+
+        STALL CHECKS MUST MEASURE EXECUTED MOTION, NOT COMMANDED MOTION (fixed 2026-08-30).
+        run_script_from_command("FORCE_MOVE ...") does NOT block: force_move.manual_move only
+        calls toolhead.dwell(), which advances print_time and returns. `pulled` therefore counts
+        millimetres QUEUED, and the old code reached its 16mm threshold in a few tens of
+        milliseconds of wall time -- while the extruder had physically moved ZERO. It then read
+        the hub encoder, correctly saw 0 pulses, and declared "strand NOT moving".
+
+        That is what failed the 2026-08-30 toolchange: exactly four FORCE_MOVE segments inside a
+        single 1s stats interval, then the raise, on filament that was very probably fine. Runs
+        that "passed" earlier only passed because the ACE's own unwind happened to have a head
+        start from _retract_async_verified's 0.1s polling, so a few pulses had accumulated. The
+        guard was measuring ACE acknowledgement latency, not filament movement.
+
+        The fix is to flush the motion queue before every measurement. Segments are still
+        queued back-to-back so the pull stays smooth; only the CHECK waits for the machine to
+        catch up. The check is also now continuous and incremental rather than one-shot.
+        """
+        # Accept-verified: raises before any extruder motion if the device refuses.
+        self._retract_async_verified(slot, cap_mm, speed)
+        toolhead = self.printer.lookup_object("toolhead")
+        pulled = 0.0
+        seg = 4.0
+        # C27: the hub encoder witnesses extruder-driven pulls. If the strand has not moved
+        # after a check window, every further segment is a grind - stop there instead of at the
+        # cap (2026-08-28: three 140mm grinds on a notch sitting in the nip).
+        enc = self.printer.lookup_object("ace_hub_encoder", None)
+
+        def _enc_pulses():
+            try:
+                st = enc.get_status(self.reactor.monotonic())
+                return int(st.get("pulses", 0)) if st.get("hooked", True) else None
+            except Exception:
+                return None
+
+        def _seat():
+            try:
+                return bool(self._seat_sensor_triggered())
+            except Exception:
+                return None
+
+        # Baseline is taken with the queue already drained by _retract_async_verified.
+        last_enc = _enc_pulses()
+        last_seat = _seat()
+        last_checked_at = 0.0
+        # Window over which "nothing moved anywhere" is a stall. Smaller than the old 16mm so
+        # the entry-switch read below is never more than this far behind the real position.
+        STALL_WINDOW_MM = 8.0
+
+        while self.manager.get_switch_state(SENSOR_TOOLHEAD):
+            err = self._confirmed_slot_error(slot)
+            if err is not None:
+                toolhead.wait_moves()
+                self._stop_retract(slot)
+                raise ValueError(
+                    "ACE[%d]: device reports '%s' on slot %d during the tandem pull - its motor "
+                    "is stopped. Pulling harder from the extruder alone would grind the filament."
+                    % (self.instance_num, err, slot))
+            if pulled >= cap_mm:
+                toolhead.wait_moves()
+                self._stop_retract(slot)
+                raise ValueError(
+                    "ACE[%d]: entry never cleared after %.0fmm of tandem pull - filament is not "
+                    "moving back" % (self.instance_num, pulled))
+            # FORCE_MOVE, not a planner move: the pull runs cold and the planner
+            # rejects cold extrusion.
+            self.gcode.run_script_from_command(
+                "FORCE_MOVE STEPPER=extruder DISTANCE=-%.1f VELOCITY=%.0f" % (seg, speed))
+            pulled += seg
+
+            if last_enc is not None and (pulled - last_checked_at) >= STALL_WINDOW_MM:
+                # Drain the queue FIRST. Without this the encoder is read against motion that
+                # has not happened yet, which is the bug this whole rewrite exists to fix.
+                toolhead.wait_moves()
+                now_p = _enc_pulses()
+                seat_now = _seat()
+                # A switch that changed state proves the strand travelled, whatever the hub
+                # encoder says: a freshly loaded lane has slack in the bowden and the first
+                # centimetres of extraction take it up without turning the hub wheel.
+                switch_moved = (seat_now != last_seat)
+                if now_p is not None and (now_p - last_enc) < 2 and not switch_moved:
+                    self._stop_retract(slot)
+                    raise ValueError(
+                        "ACE[%d]: strand NOT moving - hub encoder saw %d pulse(s) and no switch "
+                        "change over the last %.0fmm of EXECUTED tandem pull (%.0fmm total). "
+                        "Stopping before the gears chew it further (tip_suspect: the nip is on a "
+                        "section it cannot grip - cut above entry, open the idler, eject the rest "
+                        "ACE-alone)."
+                        % (self.instance_num, (now_p - last_enc),
+                           pulled - last_checked_at, pulled))
+                # Incremental baseline: a one-shot check can never catch a stall that begins
+                # after the first window, which is how the 2026-08-27 120mm and 140mm grinds ran
+                # to the cap with the guard already satisfied and disabled.
+                last_enc = now_p
+                last_seat = seat_now
+                last_checked_at = pulled
+
+        # One margin segment so the tip rests clear of the switch, not on its edge.
+        self.gcode.run_script_from_command(
+            "FORCE_MOVE STEPPER=extruder DISTANCE=-%.1f VELOCITY=%.0f" % (seg, speed))
+        pulled += seg
+        # Let the extruder actually FINISH before the ACE is told to stop. Previously the ACE
+        # was stopped while up to BUFFER_TIME_HIGH * speed (~20mm) of extruder retraction was
+        # still queued, so every successful extraction ended with the extruder pulling alone
+        # against a stationary lane - the exact wrong-actuator condition this function exists
+        # to prevent, on the success path, every single time.
+        toolhead.wait_moves()
+        self._stop_retract(slot)
+        self.gcode.respond_info(
+            "ACE[%d]: entry cleared after %.0fmm of tandem pull - toolhead free, ACE takes it "
+            "from here" % (self.instance_num, pulled))
+
     def _make_sensor_trigger_monitor(self, sensor_type):
         """
         Create a sensor trigger time monitor callback.
@@ -762,7 +1045,18 @@ class AceInstance:
             ValueError: If retraction fails after all retries
         """
         max_retries = MAX_RETRIES
-        retry_delay_s = 2.0
+        # No response at all is a comms problem, and 2s is a reasonable settle for that.
+        no_response_delay_s = 2.0
+        # A FORBIDDEN is not a comms problem: it means the PREVIOUS move is still executing, so
+        # the only sensible wait is that move's own duration. The flat 2.0s waited ten times
+        # longer than the thing it was waiting for on the eject's 2mm/10mm-s chunks, and every
+        # first attempt is rejected because wait_ready() clears the send against a status cache
+        # the heartbeat only refreshes at 1Hz -- at 5 chunks/s that race cannot be won.
+        # Measured 2026-08-21: 80mm of extraction took ~96s, ~72s of it this delay.
+        try:
+            retry_delay_s = min(2.0, max(0.15, (float(length) / float(speed)) * 1.5))
+        except (TypeError, ValueError, ZeroDivisionError):
+            retry_delay_s = 2.0
 
         # Must run BEFORE wait_ready(): with assist active, ACE2 is 'busy'
         # by design and wait_ready() would stall without this.
@@ -785,13 +1079,13 @@ class AceInstance:
             early_stop_state = {"triggered": False, "elapsed": None}
 
             if attempt > 1:
-                self.gcode.respond_info(
-                    f"ACE[{self.instance_num}]: _retract() attempt {attempt}/{max_retries}:\n"
-                    f"  Slot: {slot}\n"
-                    f"  Length: {length}mm\n"
-                    f"  Speed: {speed}mm/s\n"
-                    f"  ACE status before: {ace_status_before}"
-                )
+                banner = (f"ACE[{self.instance_num}]: _retract() attempt {attempt}/{max_retries} "
+                          f"slot={slot} len={length}mm speed={speed}mm/s "
+                          f"status={ace_status_before}")
+                if attempt >= 3:
+                    self.gcode.respond_info(banner)
+                else:
+                    logging.debug(banner)
 
             request = self.protocol.build_unwind_filament_request(slot, length, speed)
 
@@ -830,9 +1124,9 @@ class AceInstance:
                 )
                 if attempt < max_retries:
                     self.gcode.respond_info(
-                        f"ACE[{self.instance_num}]: Waiting {retry_delay_s}s before retry..."
+                        f"ACE[{self.instance_num}]: Waiting {no_response_delay_s}s before retry..."
                     )
-                    self.reactor.pause(self.reactor.monotonic() + retry_delay_s)
+                    self.reactor.pause(self.reactor.monotonic() + no_response_delay_s)
                     continue
                 else:
                     raise ValueError(
@@ -895,26 +1189,23 @@ class AceInstance:
 
                 return response
 
-            self.gcode.respond_info(
-                f"ACE[{self.instance_num}]: Retract rejected - Attempt {attempt}/{max_retries}\n"
-                f"  Response Code: {result_code}\n"
-                f"  Response Message: '{result_msg}'\n"
-                f"  Slot: {slot}\n"
-                f"  Length: {length}mm\n"
-                f"  Speed: {speed}mm/s\n"
-                f"  ACE status before: {ace_status_before}\n"
-                f"  ACE status after: {ace_status_after}"
+            # A first-attempt FORBIDDEN is the NORMAL case for chunked motion, not an incident.
+            # Eight lines of respond_info per rejection put ~600 lines through Moonraker's
+            # websocket to every connected client during one eject -- the same kind of load that
+            # stalled the reactor and broke Cartographer homing on 2026-08-21. Keep it in the log
+            # where it stays diagnosable, and only speak up once it stops looking routine.
+            reject_msg = (
+                f"ACE[{self.instance_num}]: Retract rejected - attempt {attempt}/{max_retries} "
+                f"code={result_code} msg='{result_msg}' slot={slot} len={length}mm "
+                f"speed={speed}mm/s status {ace_status_before}->{ace_status_after}"
             )
+            if attempt >= 3:
+                self.gcode.respond_info(reject_msg)
+            else:
+                logging.debug(reject_msg)
 
             if attempt < max_retries:
-                self.gcode.respond_info(
-                    f"ACE[{self.instance_num}]: Waiting {retry_delay_s}s for ACE to finish..."
-                )
                 self.reactor.pause(self.reactor.monotonic() + retry_delay_s)
-
-                self.gcode.respond_info(
-                    f"ACE[{self.instance_num}]: Verifying ACE is ready for retry {attempt + 1}..."
-                )
             else:
                 total_wait = max_retries * retry_delay_s
                 raise ValueError(
@@ -948,6 +1239,37 @@ class AceInstance:
         request = self.protocol.build_stop_unwind_filament_request(slot)
         self.send_request(request, callback)
 
+    def _wait_hot_for_seat(self):
+        """Block until the extruder can extrude, just before the seat phase moves it.
+
+        Counterpart of the load guard in manager.py, which now starts the heat with M104 and
+        lets the bowden feed run cold underneath it. By the time the filament reaches the
+        toolhead sensor the nozzle is usually at temperature and this returns immediately;
+        when it is not, waiting HERE costs only the residual, not the whole heat-up.
+        """
+        extruder = self.printer.lookup_object("extruder", None)
+        if extruder is None:
+            return
+        heater = extruder.get_heater()
+        cur = heater.get_temp(self.reactor.monotonic())[0]
+        if cur >= heater.min_extrude_temp:
+            return
+        target = heater.target_temp
+        if target < heater.min_extrude_temp:
+            # Nothing is heating and nothing asked for heat: seating would grind cold
+            # filament into a cold nozzle. Same fail-fast stance as the load guard.
+            raise ValueError(
+                f"ACE[{self.instance_num}]: extruder at {cur:.0f}\u00b0C with no active "
+                f"heat target - cannot seat filament cold"
+            )
+        self.gcode.respond_info(
+            f"ACE[{self.instance_num}]: waiting for nozzle ({cur:.0f}\u00b0C -> "
+            f"{target:.0f}\u00b0C) before seating filament"
+        )
+        self.gcode.run_script_from_command(
+            f"TEMPERATURE_WAIT SENSOR=extruder MINIMUM={max(heater.min_extrude_temp, target - 2):.0f}"
+        )
+
     def _feed_to_toolhead_with_extruder_assist(self, local_slot, feed_length, feed_speed,
                                                extruder_feeding_length, extruder_feeding_speed):
         """
@@ -971,6 +1293,7 @@ class AceInstance:
             ValueError: If feed command fails or sensor times out
         """
         self._disable_feed_assist(local_slot)
+        self.gcode.run_script_from_command("ACE_SWAP_PHASE NAME=bowden")
         self.execute_feed_with_retries(local_slot, feed_length, feed_speed)
 
         expected_time = feed_length / feed_speed
@@ -979,6 +1302,7 @@ class AceInstance:
         # Coordinated extruder nudges during ACE feed
         start_time = time.time()
 
+        err_first_seen = None
         while not self.manager.get_switch_state(SENSOR_TOOLHEAD):
             now = time.time()
             # Fail fast on the firmware's own verdict: the device aborts a
@@ -986,7 +1310,11 @@ class AceInstance:
             # timeout - don't wait blind, and don't grind with the extruder.
             if now - start_time > self.FEED_ERROR_GRACE_S:
                 slot_error = self._get_slot_feed_error(local_slot)
-                if slot_error is not None:
+                if slot_error is None:
+                    err_first_seen = None
+                elif err_first_seen is None:
+                    err_first_seen = now
+                elif now - err_first_seen >= self.FEED_ERROR_CONFIRM_S:
                     self._stop_feed(local_slot)
                     raise ValueError(
                         f"ACE[{self.instance_num}]: Firmware aborted the feed on "
@@ -998,7 +1326,9 @@ class AceInstance:
                     f"ACE[{self.instance_num}]: Feed timeout for {feed_length}mm after {timeout_s} seconds"
                 )
                 break
-            self.dwell(0.1)
+            # 20ms, not 100: at 60mm/s every poll tick is 1.2mm of overshoot past the
+            # sensor, and the stop must land inside the inline buffer's travel.
+            self.dwell(0.02)
 
         # Final sanity check
         if not self.manager.get_switch_state(SENSOR_TOOLHEAD):
@@ -1006,6 +1336,10 @@ class AceInstance:
             # assist phase: grinding the extruder against a blocked path for
             # 60s can chew the filament and leave fragments in the toolhead.
             slot_error = self._get_slot_feed_error(local_slot)
+            if slot_error is not None:
+                # Same stale-cache guard as the poll loop above.
+                self.dwell(self.FEED_ERROR_CONFIRM_S)
+                slot_error = self._get_slot_feed_error(local_slot)
             if slot_error is not None:
                 raise ValueError(
                     f"ACE[{self.instance_num}]: Firmware aborted the feed on "
@@ -1033,36 +1367,260 @@ class AceInstance:
                     f"ACE[{self.instance_num}]: Toolhead sensor finally triggered after "
                     f"running feed-assist for 60s. Continuing..."
                 )
-        self.gcode.respond_info(
-            f"ACE[{self.instance_num}]: Slowing feedspeed down {extruder_feeding_speed:.2f} for toolhead load"
-        )
+        # Rebuilt 2026-08-22/23. The old sequence SLOWED the still-queued 2500mm bulk
+        # feed and left it running through the seat -- an open-loop push with no
+        # compliance, which buckled filament into the hub (the only open volume in the
+        # path).
+        self._stop_feed(local_slot)
+        if self.seat_verify_sensor:
+            # No park at entry: the trip point does not matter when POST-GEAR terminates
+            # the crossing, so the moment the approach stops, both ends move on together
+            # -- ACE feeding and extruder pulling at the SAME speed, continuously, never
+            # taking turns (teeth turning while the ACE holds grinds the surface; the
+            # ACE pushing a clamped nip is a wall). Any stop overshoot bleeds forward
+            # through the moving nip. Cold by design: post-gear is short of the melt
+            # zone; heat gates later, at the melt-zone door.
+            self.wait_ready()
+            if self._seat_sensor_triggered():
+                # RUNOUT SWAP: post-gear already reads filament while the new head
+                # has only just crossed entry - the consumed tool's tail stub still
+                # fills gears->nozzle. The normal shape is unusable twice over: the
+                # crossing's stop condition is already true (it would end at 0mm
+                # with the head ungripped at entry), and the assist seat would
+                # starve - assist only pushes when the buffer sees the extruder
+                # pulling THIS lane, and the extruder grips the STUB (Simon's
+                # catch, 2026-08-25). Butt-to-butt instead: hot tandem COMMANDED
+                # push, ACE feeding at the extruder's speed the whole way so the
+                # new head never loses contact with the stub's tail, carrying it
+                # through the gears and melt zone while the stub extrudes out
+                # ahead of it. Post-gear cannot terminate this (it lies); fixed
+                # length, hot because the stub can only move by melting.
+                self.gcode.run_script_from_command("ACE_SWAP_PHASE NAME=stub_crossing")
+                # Simon's sequence (2026-08-25): the stub PRINTS - whatever lane
+                # the user picked, colour included ("plan your prints better").
+                # The tandem only closes most of entry->gears while the tail is
+                # STILL GRIPPED (no empty-nip spinning, no tail grinding); the
+                # head-to-tail gap persists through tandem (both ends advance
+                # equally) and is closed afterwards by the assist HUG - the
+                # lane's spring buffer presses the free head against the receding
+                # tail, exactly the hand on a manual bowden push. The handoff
+                # then completes under assist during the purge/resumed print.
+                push = self.runout_bite_length
+                self.gcode.respond_info(
+                    f"ACE[{self.instance_num}]: tail stub in the toolhead - bite "
+                    f"({push:.0f}mm hot tandem, tail stays gripped), hug follows"
+                )
+                self._wait_hot_for_seat()
+                self.execute_feed_with_retries(local_slot, push, extruder_feeding_speed)
+                pushed = 0.0
+                while pushed < push:
+                    err = self._confirmed_slot_error(local_slot)
+                    if err is not None:
+                        self._stop_feed(local_slot)
+                        self.printer.lookup_object('toolhead').wait_moves()
+                        raise ValueError(
+                            f"ACE[{self.instance_num}]: device reports '{err}' on "
+                            f"slot {local_slot} during the stub crossing - it has "
+                            f"stopped its own motor. Check the lane."
+                        )
+                    self.gcode.run_script_from_command(
+                        "FORCE_MOVE STEPPER=extruder DISTANCE=%.1f VELOCITY=%.0f"
+                        % (self.RELEASE_CHUNK_MM, extruder_feeding_speed))
+                    pushed += self.RELEASE_CHUNK_MM
+                    # Same drain as the normal crossing: `pushed` must mean executed, not
+                    # queued, or the per-chunk device-fault check below runs against motion
+                    # that has not happened and the bite over-runs its measured length.
+                    self.printer.lookup_object('toolhead').wait_moves()
+                self._stop_feed(local_slot)
+                self.wait_ready()
+                self._stub_load_completed = True
+                self.gcode.respond_info(
+                    f"ACE[{self.instance_num}]: stub crossing done ({pushed:.0f}mm) "
+                    f"- new head at the nozzle, engaging assist"
+                )
+            else:
+                self.gcode.run_script_from_command("ACE_SWAP_PHASE NAME=crossing")
+                self.execute_feed_with_retries(local_slot, 60.0, extruder_feeding_speed)
+                crossed = 0.0
+                while not self._seat_sensor_triggered():
+                    err = self._confirmed_slot_error(local_slot)
+                    if err is not None:
+                        self._stop_feed(local_slot)
+                        self.printer.lookup_object('toolhead').wait_moves()
+                        raise ValueError(
+                            f"ACE[{self.instance_num}]: device reports '{err}' on slot "
+                            f"{local_slot} during the crossing - it has stopped its own "
+                            f"motor, so continuing would only grind. Check the lane."
+                        )
+                    if crossed >= 60.0:
+                        self._stop_feed(local_slot)
+                        raise ValueError(
+                            f"ACE[{self.instance_num}]: post-gear never triggered after "
+                            f"{crossed:.0f}mm of crossing - filament is not passing the "
+                            f"gears"
+                        )
+                    # FORCE_MOVE, not a planner move: the crossing runs COLD by design and
+                    # the planner rejects cold extrusion (this failed the first genuinely
+                    # cold load, 2026-08-23 -- every earlier crossing had a hot nozzle
+                    # masking it). Same rule as the tandem extract.
+                    self.gcode.run_script_from_command(
+                        "FORCE_MOVE STEPPER=extruder DISTANCE=%.1f VELOCITY=%.0f"
+                        % (self.RELEASE_CHUNK_MM, extruder_feeding_speed))
+                    crossed += self.RELEASE_CHUNK_MM
+                    # CROSSING LOOPS MUST READ THE SENSOR AGAINST REAL POSITION (2026-08-30).
+                    # FORCE_MOVE does not block, so without this drain `crossed` counts
+                    # millimetres QUEUED and _seat_sensor_triggered() is read against a position
+                    # up to BUFFER_TIME_HIGH * speed behind the commanded total. Two failure
+                    # modes: the loop keeps commanding after the tip has physically reached
+                    # post-gear, driving it that much further toward the melt zone; or it burns
+                    # the 60mm cap and raises "post-gear never triggered" on a healthy load.
+                    # This is the same defect as the tandem stall check, mirrored.
+                    self.printer.lookup_object('toolhead').wait_moves()
+                self._stop_feed(local_slot)
+                self.wait_ready()
+                self.gcode.respond_info(
+                    f"ACE[{self.instance_num}]: post-gear triggered after {crossed:.0f}mm "
+                    f"of crossing - engaging assist"
+                )
+        else:
+            # No post-gear switch on this machine: back off to the entry release edge
+            # for a fixed datum, step to the re-trip (proof of tip motion through the
+            # soft buffer), then the configured distance to the nip; the extruder seat
+            # below carries it the rest of the way blind.
+            released_mm = 0.0
+            while self.manager.get_switch_state(SENSOR_TOOLHEAD):
+                err = self._confirmed_slot_error(local_slot)
+                if err is not None:
+                    raise ValueError(
+                        f"ACE[{self.instance_num}]: device reports '{err}' on slot "
+                        f"{local_slot} while backing off to the release edge - its "
+                        f"motor is stopped, so the tip cannot move."
+                    )
+                if released_mm >= self.RELEASE_BACKOFF_CAP_MM:
+                    raise ValueError(
+                        f"ACE[{self.instance_num}]: entry sensor still triggered after "
+                        f"{released_mm:.0f}mm of back-off - filament is not moving "
+                        f"back, check the path for a jam"
+                    )
+                self._retract(local_slot, self.RELEASE_CHUNK_MM, self.RELEASE_BACKOFF_SPEED)
+                released_mm += self.RELEASE_CHUNK_MM
+            stepped = 0.0
+            while not self.manager.get_switch_state(SENSOR_TOOLHEAD) and stepped < 24.0:
+                self.execute_feed_with_retries(
+                    local_slot, self.RELEASE_CHUNK_MM, self.RELEASE_BACKOFF_SPEED)
+                self.wait_ready()
+                stepped += self.RELEASE_CHUNK_MM
+            if not self.manager.get_switch_state(SENSOR_TOOLHEAD):
+                raise ValueError(
+                    f"ACE[{self.instance_num}]: entry sensor never re-tripped after "
+                    f"{stepped:.0f}mm of handoff feed - filament is not advancing"
+                )
+            self.execute_feed_with_retries(local_slot, self.entry_to_gear_mm,
+                                           self.RELEASE_BACKOFF_SPEED)
+            self.wait_ready()
 
-        max_speed_change_retries = 3
-        speed_changed = False
-        while not speed_changed and (max_speed_change_retries > 0):
-            speed_changed = self._change_feed_speed(local_slot, extruder_feeding_speed)
-            self.dwell(delay=0.2)
-            max_speed_change_retries -= 1
-
-        if not speed_changed:
-            self._stop_feed(local_slot)
+        # The device silently swallows an enable sent while it is still settling from the
+        # feed op (every load on 2026-08-22 logged a post-enable drop; the watchdog's late
+        # restore left the seat pulling against a statically gripped ACE). Do not move the
+        # extruder until the device CONFIRMS assist -- on ACE2 assist makes the instance
+        # 'busy' and the slot reports 'assisting'.
+        self.gcode.run_script_from_command("ACE_SWAP_PHASE NAME=assist")
+        for attempt in range(3):
+            self._enable_feed_assist(local_slot)
+            if self._wait_assist_active(local_slot, 2.5):
+                break
+            self.gcode.respond_info(
+                f"ACE[{self.instance_num}]: assist not confirmed on slot {local_slot} "
+                f"(attempt {attempt + 1}/3) - re-sending"
+            )
+        else:
             raise ValueError(
-                f"ACE[{self.instance_num}]: Failed to change feed speed to "
-                f"{extruder_feeding_speed}mm/s after multiple attempts"
+                f"ACE[{self.instance_num}]: feed assist never engaged on slot "
+                f"{local_slot} - refusing to seat against a static ACE grip"
             )
 
+        # NO heat gate here. The crossing ends at post-gear, which is cold-side of the
+        # heatbreak -- nothing that follows in THIS method enters the melt zone. The gate
+        # moved to the nozzle phase in _feed_filament_into_toolhead, which is the first
+        # thing that actually pushes into the hot end, and which an idle load skips.
+        if self.seat_verify_sensor:
+            # Post-gear already proved the extruder has the filament; the caller's
+            # sensor-to-nozzle feed runs from that datum under confirmed assist.
+            return 0.0
         self._extruder_move(extruder_feeding_length, extruder_feeding_speed, wait_for_move_end=True)
-        self._stop_feed(local_slot)
-        self.wait_ready()
-        self.gcode.respond_info(
-            f"ACE[{self.instance_num}]: Switching from feeding to feed_assist mode"
-        )
-        self._enable_feed_assist(local_slot)
-        # _enable_feed_assist already contains its own post-send wait_ready() (guarded by
-        # feed_assist_causes_busy), so a second wait here is redundant for ACE1 and would
-        # deadlock on ACE2.
-
         return self.extruder_feeding_length
+
+    def unpark_to_nozzle(self, slot, target_temp=0):
+        """Advance a PARKED tip from post-gear into the melt zone.
+
+        A park leaves the tip cold-side of the heatbreak, ~40mm short of the nozzle, with
+        post-gear still triggered. That reads as "filament present" to every sensor check,
+        which is why the toolchange used to relabel it 'nozzle' and return -- starting the
+        print 40mm short with the state claiming otherwise. This is the missing reverse of
+        the park: heat first (nothing may enter the melt zone cold), let the ACE follow
+        under assist, then push exactly the park distance back in.
+        """
+        if target_temp > 0:
+            self.gcode.run_script_from_command("M104 S%d" % int(target_temp))
+        # Assist so the ACE pays out slack instead of the extruder dragging a static lane.
+        if self._feed_assist_index != slot:
+            self._enable_feed_assist(slot)
+        # G1: the enable above is commanded, not observed. Every other push in this file
+        # waits for the device to actually assist before the extruder moves; this one only
+        # waited for heat (argus audit, 2026-08-28). Same gate as the seat.
+        if not self._wait_assist_active(slot, 8.0):
+            raise ValueError(
+                f"ACE[{self.instance_num}]: feed assist never engaged on slot {slot} - "
+                f"refusing to unpark against a static ACE grip"
+            )
+        self._wait_hot_for_seat()
+        self.gcode.respond_info(
+            f"ACE[{self.instance_num}]: unparking slot {slot} - "
+            f"{self.toolhead_full_purge_length:.0f}mm post-gear to nozzle"
+        )
+        self._extruder_move(self.toolhead_full_purge_length,
+                            self.toolhead_slow_loading_speed, wait_for_move_end=True)
+        return self.toolhead_full_purge_length
+
+    def _confirmed_slot_error(self, slot, since=None):
+        """The device's own error for this slot, or None. Confirmed, not a single frame.
+
+        The ACE reports seven distinct faults (feed/rollback/assist/preload/stuck/tangled/
+        motor) and STOPS ITS OWN MOTOR when it raises one. Loops that only watch a sensor
+        and a distance cap keep commanding into that stop, then report a generic timeout --
+        losing the one piece of information worth having. `tangled_error` in particular is
+        an instruction to go look at the spool, not to retry.
+
+        Confirmation matters as much as detection: the status cache is refreshed at 1Hz and
+        can still hold the PREVIOUS operation's fault, which killed two healthy loads on
+        2026-08-22. Same rule as the feed loop -- it must survive a refresh.
+        """
+        detail = self._get_slot_feed_error(slot)
+        if detail is None:
+            return None
+        self.dwell(self.FEED_ERROR_CONFIRM_S)
+        return self._get_slot_feed_error(slot)
+
+    def _wait_assist_active(self, slot, timeout_s):
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self._info.get("status") == "busy" and self.protocol.feed_assist_causes_busy():
+                return True
+            for s in self._info.get("slots", []):
+                if s.get("index") == slot:
+                    detail = s.get("status_detail") or s.get("status")
+                    if detail in ("assisting", "shifting"):
+                        return True
+            self.dwell(0.3)
+        return False
+
+    def _seat_sensor_triggered(self):
+        sensor = self.printer.lookup_object(
+            "filament_switch_sensor %s" % self.seat_verify_sensor, None
+        )
+        if sensor is None:
+            return True
+        return bool(sensor.get_status(self.reactor.monotonic()).get("filament_detected"))
 
     def execute_feed_with_retries(self, local_slot, feed_length, feed_speed):
         max_retries = MAX_RETRIES
@@ -1082,6 +1640,82 @@ class AceInstance:
                     f"ACE[{self.instance_num}]: Feed failed: {response.get('msg')}"
                 )
 
+    STUB_NUDGE_BUDGET_MM = 6.0
+
+    def _clear_stub_from_entry(self):
+        """Runout swap: the consumed lane's stub has re-covered the entry switch.
+
+        The tail stops within a mm of the switch when the runout is declared, and the
+        pause retract pulls it back over it. A sensor-terminated approach would then
+        end at 0mm with the new head still at the hub, and the bite would push the
+        stub off the gears. Nudge the stub down, hot, until the switch clears; the
+        budget is well inside entry->gears so the tail stays gripped.
+        """
+        self._wait_hot_for_seat()
+        moved = 0.0
+        while (self.manager.get_switch_state(SENSOR_TOOLHEAD)
+               and moved < self.STUB_NUDGE_BUDGET_MM):
+            self._extruder_move(1.0, self.extruder_feeding_speed, wait_for_move_end=True)
+            moved += 1.0
+        if self.manager.get_switch_state(SENSOR_TOOLHEAD):
+            raise ValueError(
+                f"ACE[{self.instance_num}]: entry switch still covered after a "
+                f"{self.STUB_NUDGE_BUDGET_MM:.0f}mm nudge - that is not a stub re-covering "
+                f"it. Check the toolhead before loading."
+            )
+        self.gcode.respond_info(
+            f"ACE[{self.instance_num}]: stub nudged {moved:.0f}mm to clear the entry "
+            f"switch before the approach"
+        )
+
+    # Tail alignment budget. Retract coarse (the tail may be well past the switch), creep
+    # forward fine (this sets the final reference point, so its step size IS the gap error).
+    TAIL_ALIGN_BACK_MM = 0.4
+    TAIL_ALIGN_FWD_MM = 0.2
+    TAIL_ALIGN_BACK_BUDGET_MM = 25.0
+    TAIL_ALIGN_FWD_BUDGET_MM = 10.0
+
+    def _align_tail_at_entry(self):
+        """Park the consumed tail's END exactly on the toolhead_entry trip point.
+
+        The runout fires when the tail clears entry, but it keeps moving for the debounce,
+        the deceleration and the pause retract -- so its end sits an UNKNOWN distance below
+        the switch. The incoming head stops ON that switch. Referencing both ends to the same
+        physical point turns that unknown into the switch's own hysteresis, which is what
+        lets the following tandem carry the head into the gears with neither side pushing
+        against the other.
+
+        Hot, because the tail is in the melt zone and can only move by melting. Never raises
+        on failure to find the switch: an unaligned tail still loads, just with the old
+        unknown gap, and refusing the swap outright would be worse.
+        """
+        self._wait_hot_for_seat()
+        # Phase 1: back the tail up until entry sees it again.
+        moved = 0.0
+        while (not self.manager.get_switch_state(SENSOR_TOOLHEAD)
+               and moved < self.TAIL_ALIGN_BACK_BUDGET_MM):
+            self._extruder_move(-self.TAIL_ALIGN_BACK_MM, self.extruder_feeding_speed,
+                                wait_for_move_end=True)
+            moved += self.TAIL_ALIGN_BACK_MM
+        if not self.manager.get_switch_state(SENSOR_TOOLHEAD):
+            self.gcode.respond_info(
+                f"ACE[{self.instance_num}]: tail alignment skipped - entry never saw the tail "
+                f"again after {moved:.1f}mm of retract. Loading with the old unknown gap."
+            )
+            return
+        # Phase 2: creep forward until it just clears. This is the reference point.
+        fwd = 0.0
+        while (self.manager.get_switch_state(SENSOR_TOOLHEAD)
+               and fwd < self.TAIL_ALIGN_FWD_BUDGET_MM):
+            self._extruder_move(self.TAIL_ALIGN_FWD_MM, self.extruder_feeding_speed,
+                                wait_for_move_end=True)
+            fwd += self.TAIL_ALIGN_FWD_MM
+        self.gcode.respond_info(
+            f"ACE[{self.instance_num}]: tail aligned on the entry switch "
+            f"(back {moved:.1f}mm, forward {fwd:.1f}mm) - the incoming head stops on the same "
+            f"switch, so the joint gap is now just the switch hysteresis"
+        )
+
     def _feed_filament_into_toolhead(self, tool, check_pre_condition=True):
         """Feed filament from slot to toolhead sensor, then extruder to nozzle."""
         self.wait_ready()
@@ -1099,6 +1733,17 @@ class AceInstance:
             if self.manager.get_switch_state(SENSOR_TOOLHEAD):
                 raise ValueError("Cannot feed, filament in nozzle")
 
+        self._loading_slot = local_slot
+        self._stub_load_completed = False
+        # Runout-swap signature: entry CLEAR (the tail passed it) with post-gear still
+        # TRIGGERED (the stub is in the gears). Reference the tail to the switch before the
+        # new head comes down to the same switch.
+        if (not check_pre_condition and not self.manager.get_switch_state(SENSOR_TOOLHEAD)
+                and self._seat_sensor_triggered()):
+            self._align_tail_at_entry()
+        if (not check_pre_condition and self.manager.get_switch_state(SENSOR_TOOLHEAD)
+                and self._seat_sensor_triggered()):
+            self._clear_stub_from_entry()
         try:
             self._feed_to_toolhead_with_extruder_assist(
                 local_slot,
@@ -1114,15 +1759,65 @@ class AceInstance:
                 f"retracting filament 150mm back in case it got squished and stuck "
                 f"in the filament-hub"
             )
+            # The crossing can fail with its feed op still ACTIVE on the device; the
+            # recovery retract then gets FORBIDDEN forever (6x on 2026-08-23) while the
+            # orphaned feed keeps pushing into a stationary toolhead. Kill it first.
+            self._stop_feed(local_slot)
+            self.wait_ready()
             self._retract(local_slot, 150, self.retract_speed)
 
             raise  # Re-raise the original exception
+        finally:
+            self._loading_slot = -1
 
         self.state.set(
             "ace_filament_pos",
             FILAMENT_STATE_TOOLHEAD
         )
 
+        # A load with no print behind it has no business in the melt zone: the tip would
+        # sit there cooking, and the nozzle would have to be heated for a 45mm push that
+        # nothing is waiting on. Stop at post-gear -- the same cold park the unload
+        # produces -- and let the first T<n> of a print unpark it (manager's PARKED
+        # branch). Mid-print this is skipped: there the melt zone is exactly where the
+        # filament has to be.
+        self.last_load_parked = (not self.manager._is_printing_or_paused()
+                                 or getattr(self.manager, '_force_cold_load', False))
+        if self.last_load_parked:
+            self.gcode.respond_info(
+                f"ACE[{self.instance_num}]: idle load - parking at post-gear, cold "
+                f"(no print running, so nothing needs the melt zone)"
+            )
+            self.gcode.run_script_from_command("M104 S0")
+            self.gcode.run_script_from_command(
+                "SAVE_VARIABLE VARIABLE=filament_parked VALUE=1")
+            self.gcode.run_script_from_command(
+                "SAVE_VARIABLE VARIABLE=filament_loaded_hot VALUE=0")
+            return 0.0
+
+        # Stub load: the bite left the joint near the nip with assist now engaged.
+        # A short extruder-only push seats the hug - the spring closes any
+        # remaining gap as the tail recedes (Simon's 2-4mm "make sure the head
+        # is pushing against the tail"). No 90mm seat: the melt zone never
+        # emptied, and the stub prints into the part.
+        if getattr(self, '_stub_load_completed', False):
+            self._stub_load_completed = False
+            self.gcode.respond_info(
+                f"ACE[{self.instance_num}]: hug push - {self.runout_hug_length:.0f}mm "
+                f"under assist to press the head against the tail"
+            )
+            self._extruder_move(self.runout_hug_length, self.extruder_feeding_speed,
+                                wait_for_move_end=True)
+            self.state.set("ace_filament_pos", FILAMENT_STATE_NOZZLE)
+            # 0.0: everything extruded so far was stub/joint material, and the
+            # ENDLESS purge path voids the credit anyway.
+            return 0.0
+
+        # The melt-zone door: the first push into the hot end, and the only place a load
+        # may block for temperature.
+        self.gcode.run_script_from_command("ACE_SWAP_PHASE NAME=heat_wait")
+        self._wait_hot_for_seat()
+        self.gcode.run_script_from_command("ACE_SWAP_PHASE NAME=nozzle")
         self.gcode.run_script_from_command("G92 E0")
         self.gcode.respond_info(
             f"ACE[{self.instance_num}]: Feeding from sensor to nozzle..."
@@ -2179,7 +2874,7 @@ class AceInstance:
                     )
                 except Exception:
                     expected_ace, expected_slot = None, -1
-            if expected_ace is not self or expected_slot != slot:
+            if (expected_ace is not self or expected_slot != slot)                     and slot != self._loading_slot:
                 self.gcode.respond_info(
                     f"ACE[{self.instance_num}]: NOT restoring feed assist on "
                     f"slot {slot} - it does not belong to the current tool "
@@ -2323,7 +3018,7 @@ class AceInstance:
                         )
                     except Exception:
                         expected_ace, expected_slot = None, -1
-                if expected_ace is not self or expected_slot != slot:
+                if (expected_ace is not self or expected_slot != slot)                         and slot != self._loading_slot:
                     self.gcode.respond_info(
                         f"ACE[{self.instance_num}]: NOT restoring feed assist "
                         f"on slot {slot} - it does not belong to the current "

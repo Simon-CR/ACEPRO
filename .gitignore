@@ -206,3 +206,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+# Working backups taken before each in-place patch. Kept on disk deliberately as
+# quick restore points, but they are noise in history - git IS the history now.
+*.bak-*
+*.orig-*
+*.probe-*

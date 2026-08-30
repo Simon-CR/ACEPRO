@@ -29,10 +29,11 @@ def _build_ace2_command_catalog() -> Tuple[AceCommandSpec, ...]:
         AceCommandSpec("SET_RFID_ENABLE", 14, "diagnostic", "SetRfidEnableRequest", "GenericResponse"),
         AceCommandSpec("LINEAR_KEY_CALIBRATE", 15, "debug", "LinearCalibrationRequest", "GenericResponse"),
         AceCommandSpec("SET_FEED_CHECK", 19, "diagnostic", "SetFeedCheckRequest", "GenericResponse"),
+        AceCommandSpec("SET_PRINTER_STATUS", 20, "diagnostic", "SetPrinterStatusRequest", "GenericResponse"),
         AceCommandSpec("GET_TEMP", 64, "diagnostic", response_type="GetTempResponse"),
         AceCommandSpec("SET_DRY_POWER", 65, "debug", "SetDryPowerRequest", "GenericResponse"),
         AceCommandSpec("SET_VALVE", 66, "debug", "SetValveRequest", "GenericResponse"),
-        AceCommandSpec("FILAMENT_IDENTIFY", 68, "diagnostic", "RfidRequest", "GenericResponse"),
+        AceCommandSpec("FILAMENT_IDENTIFY", 68, "diagnostic", "RfidRequest", "FilamentInfoResponse"),
         AceCommandSpec("RFID_TEST", 69, "debug", "RfidTestRequest", "GenericResponse"),
         AceCommandSpec("FLASH_LED", 70, "debug", "FlashLedRequest", "GenericResponse"),
         AceCommandSpec("SET_FAN", 71, "debug", "SetFanRequest", "GenericResponse"),
@@ -59,7 +60,7 @@ ACE2_BOUND_GENERIC_ACK_COMMANDS = {
     if spec.response_type == "GenericResponse"
     and spec.tier != "debug"
     and spec.name != "ASSIGN_DEVICE_ID"
-}
+} | {"FILAMENT_IDENTIFY"}
 
 # ---------------------------------------------------------------------------
 # ACE2 protocol constants
@@ -322,6 +323,8 @@ class AceProtoProtocolAdapter(AceProtocolAdapter):
                 _pb_uint32(1, int(params["check_length"]))
                 + _pb_uint32(2, int(params["error_length"]))
             )
+        if command_name == "SET_PRINTER_STATUS":
+            return _pb_uint32(1, int(params["status"]))
         if command_name == "SET_DRY_POWER":
             return _pb_uint32(1, int(params["power"]))
         if command_name == "SET_VALVE":
@@ -431,7 +434,33 @@ class AceProtoProtocolAdapter(AceProtocolAdapter):
                     "slots": slots,
                 },
             }
-        if command_name == "GET_FILAMENT_INFO":
+        if command_name == "GET_FEED_INFO":
+            # One sub-message per slot, in slot order. Values are MEASURED by the ACE, not
+            # echoes of the command: a 723mm retract has been observed reporting 733mm
+            # delivered. This is a last-operation register, not an odometer -- field 1 does
+            # not accumulate across operations, so read it before the next move.
+            slots = []
+            for _, slot_payload in fields.get(1, []):
+                slot_fields = _pb_decode(slot_payload) if slot_payload else {}
+                counts = int(_pb_first(slot_fields, 1, 0))
+                magnitude_mm = int(_pb_first(slot_fields, 2, 0))
+                moved = int(_pb_first(slot_fields, 3, 0))
+                # field 3 is two's-complement int64: negative means a retract.
+                if moved >= (1 << 63):
+                    moved -= 1 << 64
+                slots.append(
+                    {
+                        "motor_counts": counts,
+                        "magnitude_mm": magnitude_mm,
+                        "moved_mm": moved,
+                    }
+                )
+            return {
+                "code": 0,
+                "msg": ACE2_RESPONSE_CODE_NAMES[0],
+                "result": {"slots": slots},
+            }
+        if command_name in ("GET_FILAMENT_INFO", "FILAMENT_IDENTIFY"):
             extruder_payload = _pb_first(fields, 6, b"")
             extruder_fields = _pb_decode(extruder_payload) if extruder_payload else {}
             hotbed_payload = _pb_first(fields, 7, b"")
@@ -650,6 +679,45 @@ class AceProtoProtocolAdapter(AceProtocolAdapter):
 
     def build_stop_feed_assist_request(self, slot_index: int) -> Dict[str, Any]:
         """Build the ACE2 feed-assist stop request."""
+        return self._build_command_request(
+            "STOP_FEED_OR_ROLLBACK",
+            {"index": slot_index},
+        )
+
+    def build_start_rollback_assist_request(
+        self,
+        slot_index: int,
+        length: float = 3000.0,
+        speed: float = 40.0,
+    ) -> Dict[str, Any]:
+        """Build the ACE2 ROLLBACK-assist (reverse assist) start request -- mode 3.
+
+        The mirror of mode 2. Mode 2 makes the ACE follow the extruder while it PULLS filament
+        in; mode 3 makes the ACE follow while the extruder RETRACTS, taking up the slack as it
+        goes. The device decides when to move from buffer tension, so the two ends never have to
+        be hand-synchronised -- which is the entire failure mode of a driven tandem pull.
+
+        Proven on hardware 2026-08-29/30: the ACE rewinds continuously, stops when the buffer is
+        pushed in, resumes when released. With postgear engaged, mode 3 plus 5mm of extruder
+        retract cleared the switch instantly where 350mm of plain mode-1 unwind had done nothing.
+
+        The firmware clamps the assist to ~50 mm/s internally regardless of what is sent here, so
+        any extruder retraction MUST stay below that or the extruder outruns the ACE. length is
+        sent large rather than 0: mode 3 was only ever verified on hardware with a large length,
+        and 0 is untested for this mode.
+        """
+        return self._build_command_request(
+            "FEED_OR_ROLLBACK",
+            {
+                "index": slot_index,
+                "length": int(length),
+                "speed": int(speed),
+                "mode": 3,
+            },
+        )
+
+    def build_stop_rollback_assist_request(self, slot_index: int) -> Dict[str, Any]:
+        """Stop rollback assist. Same STOP as every other FEED_OR_ROLLBACK activity."""
         return self._build_command_request(
             "STOP_FEED_OR_ROLLBACK",
             {"index": slot_index},

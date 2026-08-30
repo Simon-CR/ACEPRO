@@ -154,6 +154,7 @@ class AceManager:
         self.default_color_change_purge_length = float(self.ace_config["default_color_change_purge_length"])
         self.default_color_change_purge_speed = float(self.ace_config["default_color_change_purge_speed"])
         self.toolchange_purge_length = self.default_color_change_purge_length
+        self.runout_swap_purge_length = float(self.ace_config["runout_swap_purge_length"])
         self.toolchange_purge_speed = self.default_color_change_purge_speed
         self.purge_max_chunk_length = float(self.ace_config["purge_max_chunk_length"])
         self.pre_cut_retract_length = float(self.ace_config["pre_cut_retract_length"])
@@ -668,11 +669,36 @@ class AceManager:
         )
 
         if toolhead_has_filament or rdm_has_filament:
-            # At least one sensor confirms filament — state looks plausible.
+            # POST-GEAR RULE (Simon, 2026-08-28): the post-gear switch sits 51.7mm above the
+            # nozzle, the entry switch 71.7mm. Post-gear CLEAR proves the tip is above 51.7 -
+            # cold side of the heatbreak, NOT in the nozzle - whatever the persisted state says.
+            # Entry alone cannot confirm 'nozzle'; on 2026-08-28 09:46 it "confirmed" a tip
+            # that a grind had left 20mm above post-gear, and the next PRINT_START treated it
+            # as seated. Correct the position instead of confirming it.
+            post_state = None
+            try:
+                inst = self.instances[get_instance_from_tool(current_index)]
+                if getattr(inst, "seat_verify_sensor", ""):
+                    post_state = inst._seat_sensor_triggered()
+            except Exception:
+                logging.exception("ACE: post-gear read failed during startup validation")
+            if filament_pos == FILAMENT_STATE_NOZZLE and post_state is False:
+                self.gcode.respond_info(
+                    f"ACE: \u26a0 STARTUP VALIDATION — T{current_index} was recorded at the "
+                    f"NOZZLE but the post-gear switch is CLEAR: the tip is above the post-gear "
+                    f"switch, not in the melt zone. Correcting ace_filament_pos to "
+                    f"'toolhead' (cold side: a cold pull is legal, a seat is required before "
+                    f"printing)."
+                )
+                self.state.set_and_save("ace_filament_pos", FILAMENT_STATE_TOOLHEAD)
+                filament_pos = FILAMENT_STATE_TOOLHEAD
+            post_txt = ("n/a" if post_state is None
+                        else ("present" if post_state else "clear"))
             self.gcode.respond_info(
                 f"ACE: Startup validation — T{current_index} state "
                 f"(filament_pos='{filament_pos}') confirmed by sensors "
-                f"(toolhead={'present' if toolhead_has_filament else 'clear'}, "
+                f"(entry={'present' if toolhead_has_filament else 'clear'}, "
+                f"post-gear={post_txt}, "
                 f"rdm={'present' if rdm_has_filament else 'clear'})"
             )
             return
@@ -734,6 +760,23 @@ class AceManager:
                     return
         except Exception:
             pass  # If print_stats unavailable, assume idle.
+
+        # An empty LANE does not mean an empty TOOLHEAD. A tail in transit, or a spool that
+        # ran out after its filament was already loaded, both look exactly like this - and
+        # the filament is still there, still printable, and still owned by that lane. Only
+        # the supply behind it is gone. Disowning it here made ACE_PREFLIGHT refuse the print
+        # and then made the toolchange refuse too, because nothing could short-circuit to
+        # "already loaded" (2026-08-26).
+        try:
+            if self.get_switch_state(SENSOR_TOOLHEAD):
+                self.gcode.respond_info(
+                    f"ACE: T{global_tool}'s lane reports EMPTY ({reason}), but its filament "
+                    f"is still at the toolhead - keeping T{global_tool} as the loaded tool. "
+                    f"The runout engages at the toolhead sensor when the tail gets there."
+                )
+                return
+        except Exception:
+            pass  # Sensor unavailable: fall through to the old, safe behaviour.
 
         self.gcode.respond_info(
             f"ACE: \u26a0 T{global_tool} was recorded as loaded "
@@ -1110,8 +1153,12 @@ class AceManager:
             ace_inst.wait_ready()
             ace_inst._retract(local_slot, length=retract_length, speed=retract_speed)
 
-            self.gcode.run_script_from_command("M83")  # Relative extrusion
-            self.gcode.run_script_from_command(f"G1 E-{retract_length} F{retract_speed_mmmin}")
+            if self._ace_cold_move():
+                self.gcode.run_script_from_command(
+                    f"FORCE_MOVE STEPPER=extruder DISTANCE=-{retract_length} VELOCITY={retract_speed}")
+            else:
+                self.gcode.run_script_from_command("M83")  # Relative extrusion
+                self.gcode.run_script_from_command(f"G1 E-{retract_length} F{retract_speed_mmmin}")
 
             ace_inst.wait_ready()
             motion_time = retract_length / retract_speed
@@ -1159,6 +1206,14 @@ class AceManager:
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.wait_moves()
 
+    def _ace_cold_move(self):
+        """True when the extruder is below min_extrude_temp, so FORCE_MOVE is required."""
+        try:
+            heater = self.printer.lookup_object("toolhead").get_extruder().get_heater()
+            return not heater.can_extrude
+        except Exception:
+            return False
+
     def _extruder_move(self, length, speed, wait_for_move_end=False):
         """Move extruder (relative) via motion planner, synchronously."""
         if length == 0:
@@ -1173,9 +1228,13 @@ class AceManager:
         new_pos = cur_pos[:]
         new_pos[3] += length
 
-        toolhead.move(new_pos, speed)
-        if wait_for_move_end:
-            toolhead.wait_moves()
+        if self._ace_cold_move():
+            self.gcode.run_script_from_command(
+                f"FORCE_MOVE STEPPER=extruder DISTANCE={length} VELOCITY={speed}")
+        else:
+            toolhead.move(new_pos, speed)
+            if wait_for_move_end:
+                toolhead.wait_moves()
 
     @toolchange_in_progress_guard
     def smart_unload(self, tool_index=-1, prepare_toolhead=True, keep_heater=False,
@@ -1319,8 +1378,38 @@ class AceManager:
                     f"({retract_length:.3f}mm at {retract_speed:.3f}mm/s)"
                 )
 
-                # Start extruder retraction (10% faster for slack)
-                self._extruder_move(-abs(retract_length), retract_speed * 1.10, wait_for_move_end=False)
+                # GUARDED TOOLHEAD CLEAR (2026-08-30).
+                #
+                # What used to be here: start an extruder retract 10% faster than the ACE, with
+                # feed assist explicitly DISABLED (above) and no confirmation the ACE had even
+                # accepted its own retract, then fire the ACE retract concurrently. If the device
+                # refused - and it refuses routinely, with FORBIDDEN, for ~20-30s after any
+                # STOP_FEED_OR_ROLLBACK - the extruder pulled alone against a lane the ACE was
+                # clamping. That is the documented 43.6s / 140mm grind (2026-08-20, -27, -28),
+                # and it is the exact failure every other unload path was rebuilt to eliminate.
+                # smart_unload was simply never included in that rebuild, while remaining
+                # reachable through ACE_CHANGE_TOOL TOOL=-1, ACE_SMART_UNLOAD,
+                # _ACE_HANDLE_PRINT_END and perform_tool_change's plausibility-mismatch recovery
+                # - the first of which the driver's own error messages recommend to operators.
+                #
+                # Now: clear the toolhead with the same sensor-terminated, stall-guarded
+                # primitive ACE_LANE_PARK uses. _tandem_extract refuses to move the extruder at
+                # all until the ACE has accepted the retract, terminates on the entry switch
+                # rather than a fixed distance, and aborts after 16mm if neither the hub encoder
+                # nor the seat switch shows movement. Only once entry is sensor-confirmed clear
+                # does the long ACE-alone pull below run - on a strand nothing is gripping.
+                if self.get_instant_switch_state(SENSOR_TOOLHEAD):
+                    try:
+                        instance._tandem_extract(
+                            local_slot,
+                            min(float(retract_speed), 20.),
+                            abs(float(retract_length)) + 80.,
+                        )
+                    except Exception as exc:
+                        self.gcode.respond_info(
+                            "ACE: smart_unload aborted - guarded toolhead clear failed on "
+                            "T%s: %s" % (tool_index, exc))
+                        return False
 
                 # Start ACE retraction — use the RDM early stop only when the
                 # RDM actually sees filament right now.  Its callback stops the
@@ -1341,8 +1430,8 @@ class AceManager:
                         length=parkposition_to_toolhead_length + retract_length,
                     )
 
-                # Wait for extruder to finish
-                self._wait_toolhead_move_finished()
+                # (No concurrent extruder move to wait for any more - the guarded clear above
+                # is synchronous and already terminated on the entry switch.)
 
                 if unload_ok and self.is_filament_path_free_instant():
                     self.state.set("ace_filament_pos", FILAMENT_STATE_BOWDEN)
@@ -2861,6 +2950,30 @@ class AceManager:
             )
 
             # Check toolhead sensor, if it shows filament we assume tool is loaded and persiststate was wrong
+            if sensor_has_filament and filament_pos == FILAMENT_STATE_TOOLHEAD:
+                # PARKED, not loaded. post-gear is triggered either way, so the sensor
+                # alone cannot tell the two apart -- filament_pos is what distinguishes
+                # them, and 'toolhead' means the tip is cold-side of the heatbreak. This
+                # used to fall into the branch below and be relabelled 'nozzle', which
+                # silently started prints ~40mm short. Do the reverse of the park instead.
+                self.gcode.respond_info(
+                    f"ACE: Tool {target_tool} is PARKED at post-gear - unparking to the nozzle"
+                )
+                instance_idx = get_instance_from_tool(target_tool)
+                local_slot = get_local_slot(target_tool, instance_idx)
+                instance = (self.instances[instance_idx]
+                            if instance_idx < len(self.instances) else None)
+                if instance is None:
+                    raise Exception(f"Tool {target_tool} not managed by any ACE instance")
+                instance.unpark_to_nozzle(local_slot, target_temp)
+                self.state.set("ace_filament_pos", FILAMENT_STATE_NOZZLE)
+                self.gcode.run_script_from_command(
+                    "SAVE_VARIABLE VARIABLE=filament_parked VALUE=0")
+                self.gcode.run_script_from_command(
+                    "SAVE_VARIABLE VARIABLE=filament_loaded_hot VALUE=1")
+                self.state.set("ace_target_index", -1)
+                return f"Tool {target_tool} (unparked)"
+
             if sensor_has_filament:
                 self.gcode.respond_info(
                     "ACE: Toolhead sensor triggered - filament present. Correcting state to 'nozzle'"
@@ -2892,7 +3005,10 @@ class AceManager:
 
         # ===== PRE-TOOLCHANGE (Macro handles heating) =====
         self.gcode.run_script_from_command(
-            f"_ACE_PRE_TOOLCHANGE FROM={current_tool} TO={target_tool} TARGET_TEMP={target_temp}"
+            f"_ACE_PRE_TOOLCHANGE FROM={current_tool} TO={target_tool} "
+            f"TARGET_TEMP={target_temp} "
+            f"COLD={1 if getattr(self, '_force_cold_load', False) else 0} "
+            f"ENDLESS={1 if (is_endless_spool and current_tool != -1) else 0}"
         )
 
         # ===== UNLOAD CURRENT TOOL =====
@@ -2926,9 +3042,26 @@ class AceManager:
                     self.gcode.respond_info(f"ACE: Tool {current_tool} unloaded successfully")
 
             elif filament_pos == FILAMENT_STATE_BOWDEN:
-                self.gcode.respond_info(
-                    f"ACE: Tool {current_tool} not loaded (filament_pos='{filament_pos}'), skipping unload"
-                )
+                # Trust sensors over persisted state, same as the NOZZLE/SPLITTER branch
+                # above. 'bowden' only means "not confirmed at the nozzle" -- it does NOT
+                # mean clear of the hub. Skipping blind here let an incompletely-retracted
+                # lane sit in the shared path while the next tool fed in, colliding at the
+                # 4-to-1 and bending the tip (2026-08-22).
+                if self.is_filament_path_free():
+                    self.gcode.respond_info(
+                        f"ACE: Tool {current_tool} not loaded (filament_pos='{filament_pos}'), "
+                        f"sensors confirm path clear - skipping unload"
+                    )
+                else:
+                    self.gcode.respond_info(
+                        f"ACE: Tool {current_tool} filament_pos='{filament_pos}' but sensors "
+                        f"report filament still in the shared path - unloading before the "
+                        f"next lane feeds in"
+                    )
+                    success = self.smart_unload(tool_index=current_tool, keep_heater=True)
+                    if not success:
+                        raise Exception(f"Failed to unload tool {current_tool}")
+                    self.gcode.respond_info(f"ACE: Tool {current_tool} unloaded successfully")
 
             else:
                 self.gcode.respond_info(f"ACE: Unknown filament_pos='{filament_pos}', checking sensors...")
@@ -2979,12 +3112,35 @@ class AceManager:
                 cur_temp = extruder.get_heater().get_temp(self.reactor.monotonic())[0]
                 min_temp = extruder.get_heater().min_extrude_temp
                 if cur_temp < min_temp:
-                    self.gcode.respond_info(
-                        f"ACE: Extruder too cold ({cur_temp:.0f}°C < {min_temp:.0f}°C) "
-                        f"— waiting for temperature before load"
-                    )
-                    if target_temp > 0:
-                        self.gcode.run_script_from_command(f"M109 S{target_temp}")
+                    # Start the heat but DO NOT wait here. The bowden feed that follows is
+                    # ACE-only -- the extruder does not move until the seat phase, which has
+                    # its own temperature wait (_wait_hot_for_seat). Blocking here serialised
+                    # ~30s of heating in front of a ~25s feed that needs none of it.
+                    if (target_temp > 0 and self._is_printing_or_paused()
+                            and not getattr(self, '_force_cold_load', False)):
+                        self.gcode.respond_info(
+                            f"ACE: Extruder cold ({cur_temp:.0f}°C) — heating to "
+                            f"{target_temp:.0f}°C while the bowden feeds"
+                        )
+                        self.gcode.run_script_from_command(f"M104 S{target_temp}")
+                    elif target_temp > 0:
+                        # Idle load: J58 parks cold at post-gear and never enters the melt
+                        # zone, so this heat bought nothing -- observed heating to 210 and
+                        # straight back to 0 on every idle load (2026-08-25). The one idle
+                        # path that DOES need heat (unpark of a parked tool) heats itself.
+                        self.gcode.respond_info(
+                            f"ACE: idle load - staying cold (the park never enters the melt zone)"
+                        )
+                    elif not self._is_printing_or_paused():
+                        # Idle load with no target: the PRE macro's deliberate choice
+                        # (J58 parks the tip at post-gear, the melt zone is never opened),
+                        # not a failure to heat. Raising here made MMU_LOAD unusable from
+                        # a cold machine. A path that DOES need the melt zone -- unpark of
+                        # a parked tool -- sets its own target before getting here.
+                        self.gcode.respond_info(
+                            "ACE: idle load with no target - loading cold "
+                            "(the tip parks at post-gear, the melt zone stays shut)"
+                        )
                     else:
                         raise Exception(
                             f"Extruder too cold ({cur_temp:.0f}°C) and no target "
@@ -2992,13 +3148,71 @@ class AceManager:
                         )
 
             self.gcode.respond_info(f"ACE[{target_ace.instance_num}]: Loading tool {target_tool}...")
+            # Baseline for the retry's evidence check below.
+            _enc0 = self.printer.lookup_object("ace_hub_encoder", None)
+            try:
+                self._pulses_before_load = (
+                    _enc0.get_status(self.reactor.monotonic()).get("pulses", 0)
+                    if _enc0 is not None else 0)
+            except Exception:
+                self._pulses_before_load = 0
 
             # Capture the amount purged during loading
-            purged_amount = target_ace._feed_filament_into_toolhead(target_tool, check_pre_condition=False)
+            try:
+                purged_amount = target_ace._feed_filament_into_toolhead(
+                    target_tool, check_pre_condition=False)
+            except Exception as first_err:
+                # ONE retry, and only on evidence. The failure path in
+                # _feed_filament_into_toolhead has already stopped the feed and pulled 150mm
+                # back, so the lane is clear to re-approach; most load failures are a tip
+                # that caught rather than a blocked path, and they succeed second time.
+                #
+                # The evidence requirement matters: retrying a path that did not actually
+                # move is just grinding the same spot twice. The hub encoder counts real
+                # filament motion (J64 -- it is trustworthy, and zero pulses means zero
+                # motion), so a recovery retract that produced no pulses means the filament
+                # is genuinely stuck and a second attempt would only make it worse.
+                enc = self.printer.lookup_object("ace_hub_encoder", None)
+                moved = None
+                if enc is not None:
+                    try:
+                        now = self.reactor.monotonic()
+                        pulses = enc.get_status(now).get("pulses", 0)
+                        moved = pulses != getattr(self, "_pulses_before_load", pulses)
+                    except Exception:
+                        moved = None
+                if moved is False:
+                    self.gcode.respond_info(
+                        f"ACE: load of T{target_tool} failed and the recovery retract moved "
+                        f"NO filament past the hub - not retrying, the path is blocked. "
+                        f"({first_err})"
+                    )
+                    raise
+                self.gcode.respond_info(
+                    f"ACE: load of T{target_tool} failed ({first_err}) - path was pulled "
+                    f"back and filament did move, retrying once"
+                )
+                purged_amount = target_ace._feed_filament_into_toolhead(
+                    target_tool, check_pre_condition=False)
+                self.gcode.respond_info(f"ACE: T{target_tool} loaded on the retry")
 
             self.state.set("ace_current_index", target_tool)
             # Load confirmed -- the attempted toolchange is no longer in flight.
             self.state.set("ace_target_index", -1)
+
+            # Bill HERE, at the lane change, not only from _ACE_POST_TOOLCHANGE.
+            # 2026-08-26: a runout swap raised before reaching POST, so the backend
+            # stayed pointed at the spool that had just run out and ~440mm of the NEW
+            # spool was charged to the empty one. Both calls are idempotent, so the
+            # POST hook doing it again costs nothing.
+            try:
+                self.gcode.run_script_from_command(
+                    f"ACE_ACCOUNT_SEGMENT FROM={current_tool}")
+                self.gcode.run_script_from_command(
+                    f"_ACE_BILL_SPOOL TO={target_tool}")
+            except Exception as bill_err:
+                self.gcode.respond_info(
+                    f"ACE: Warning - billing handoff to T{target_tool} failed: {bill_err}")
             self.gcode.run_script_from_command(
                 f"SET_GCODE_VARIABLE MACRO=_ACE_STATE VARIABLE=active VALUE={target_tool}"
             )
@@ -3027,7 +3241,10 @@ class AceManager:
             toolchange_purge_speed = self.toolchange_purge_speed
 
             if is_endless_spool and current_tool != -1:
-                purge_length = int(toolchange_purge_length * 1.5)
+                # Runout swap: the stub prints into the part whatever the colour
+                # (Simon's call) - this token purge drives the hub-encoder
+                # handoff verification, carries the brush wipe, restores pressure.
+                purge_length = int(self.runout_swap_purge_length)
             else:
                 purge_length = toolchange_purge_length
 
@@ -3041,7 +3258,9 @@ class AceManager:
                 f"_ACE_POST_TOOLCHANGE FROM={current_tool} TO={target_tool} "
                 f"PURGELENGTH={final_purge_length} PURGESPEED={toolchange_purge_speed} "
                 f"TARGET_TEMP={target_temp} PURGED_AMOUNT={purged_amount:.1f} "
-                f"PURGE_MAX_CHUNK_LENGTH={self.purge_max_chunk_length}"
+                f"PARKED={1 if getattr(target_ace, 'last_load_parked', False) else 0} "
+                f"PURGE_MAX_CHUNK_LENGTH={self.purge_max_chunk_length} "
+                f"ENDLESS={1 if (is_endless_spool and current_tool != -1) else 0}"
             )
 
             gcode_move.reset_last_position()

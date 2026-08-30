@@ -28,6 +28,7 @@ class TemperatureACE:
 
         # Temperature state
         self.temp = 0.0
+        self.humidity = 0.0
         self.min_temp = 0.0
         self.max_temp = 70.0
         self.measured_min = float("inf")
@@ -123,6 +124,9 @@ class TemperatureACE:
                     self._sample_logged = True
 
                 self.temp = ace_temp
+                self.humidity = float(
+                    self._ace_instance._info.get("humidity", 0.0) or 0.0
+                )
 
                 if self.temp > 0:
                     self.measured_min = min(self.measured_min, self.temp)
@@ -174,6 +178,7 @@ class TemperatureACE:
             else 0.0,
             "measured_max_temp": round(self.measured_max, 2),
             "ace_instance": self.instance_num,
+            "humidity": round(self.humidity, 1),
         }
 
 

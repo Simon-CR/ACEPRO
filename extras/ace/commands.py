@@ -677,9 +677,23 @@ def cmd_ACE_RETRACT(gcmd):
         speed = gcmd.get_int("SPEED", ace.retract_speed)
 
         validate_feed_and_retract_arguments(gcmd, ace, slot, length, speed)
-        ace._retract(slot, length, speed)
+        if gcmd.get_int("ASYNC", 0):
+            ace._retract_async(slot, length, speed)
+        else:
+            ace._retract(slot, length, speed)
     except Exception as e:
         gcmd.respond_info(f"ACE_RETRACT error: {e}")
+
+
+def cmd_ACE_TANDEM_EXTRACT(gcmd):
+    """Tandem extract: both ends pull until the entry sensor clears."""
+    try:
+        ace, slot = ace_get_instance_and_slot(gcmd)
+        speed = gcmd.get_int("SPEED", 20)
+        cap = gcmd.get_float("CAP", 160.0)
+        ace._tandem_extract(slot, speed, cap)
+    except Exception as e:
+        gcmd.respond_info(f"ACE_TANDEM_EXTRACT error: {e}")
 
 
 def cmd_ACE_STOP_RETRACT(gcmd):
@@ -1158,6 +1172,49 @@ def cmd_ACE_DISABLE_ENDLESS_SPOOL(gcmd):
     logging.info("ACE: Endless spool DISABLED (persisted)")
 
 
+def cmd_ACE_RUNOUT_MODE(gcmd):
+    """Set or show the runout engage mode.
+
+    MODE=auto    swap to the match_mode match hands-off; prompt if none
+    MODE=strict  auto ONLY on an exact material+colour match
+    MODE=prompt  always pause and offer candidate lanes as buttons (default)
+    MODE=off     legacy pause-only prompt, no candidates
+    """
+    manager = ace_get_manager(0)
+    mode = gcmd.get('MODE', None)
+    if mode is None:
+        cur = manager.state.get("ace_runout_engage_mode", None)
+        if cur not in ("auto", "prompt", "strict", "off"):
+            cur = ("auto" if manager.state.get(
+                "ace_endless_spool_enabled", False) else "prompt")
+        gcmd.respond_info(f"Runout engage mode: {cur}")
+        return
+    mode = mode.lower().strip()
+    if mode not in ("auto", "strict", "prompt", "off"):
+        raise gcmd.error("MODE must be auto, strict, prompt or off")
+    manager.state.set_and_save("ace_runout_engage_mode", mode)
+    gcmd.respond_info(f"Runout engage mode: {mode} (persisted)")
+
+
+def cmd_ACE_RUNOUT_SWAP(gcmd):
+    """Swap to TOOL after a runout. Prompt-button target; also works by hand."""
+    manager = ace_get_manager(0)
+    to_tool = gcmd.get_int('TOOL')
+    from_tool = manager.state.get("ace_runout_pending_from", -1)
+    if from_tool is None or from_tool < 0:
+        from_tool = manager.state.get("ace_current_index", -1)
+    if from_tool < 0:
+        raise gcmd.error("No runout context and no loaded tool - nothing to swap from")
+    if to_tool == from_tool:
+        raise gcmd.error(f"T{to_tool} is the lane that ran out - pick another")
+    manager.state.set("ace_runout_pending_from", -1)
+    manager.gcode.run_script_from_command(
+        'RESPOND TYPE=command MSG="action:prompt_end"'
+    )
+    gcmd.respond_info(f"ACE: Runout swap (manual): T{from_tool} → T{to_tool}")
+    manager.endless_spool.execute_swap(from_tool, to_tool)
+
+
 def cmd_ACE_RESET_PERSISTENT_INVENTORY(gcmd):
     """Reset persistent filament inventory to empty slots. INSTANCE= for single, omit for all."""
     instance_num = gcmd.get_int("INSTANCE", default=None)
@@ -1443,6 +1500,10 @@ def cmd_ACE_ENDLESS_SPOOL_STATUS(gcmd):
 
         gcmd.respond_info("=== ACE Endless Spool Status ===")
         gcmd.respond_info(f"Endless spool enabled: {endless_spool_enabled}")
+        engage_mode = manager.state.get("ace_runout_engage_mode", None)
+        if engage_mode not in ("auto", "prompt", "strict", "off"):
+            engage_mode = "auto" if endless_spool_enabled else "prompt"
+        gcmd.respond_info(f"Runout engage mode: {engage_mode}")
         gcmd.respond_info("Mode: Automatic switching on runout detection")
         gcmd.respond_info("Scope: Global (searches across all ACE instances)")
         gcmd.respond_info(f"Total ACE instances: {len(INSTANCE_MANAGERS)}")
@@ -1587,6 +1648,23 @@ def cmd_ACE_CHANGE_TOOL(manager, gcmd, tool_index):
 
     printer = get_printer()
 
+    # TOOL -> GATE redirection. Every T<n> and ACE_CHANGE_TOOL funnels through here, so
+    # this is the one place a reprint's T1 can be sent to a different lane without
+    # reslicing. Billing follows for free: everything downstream keys on the gate.
+    if tool_index >= 0:
+        shim = printer.lookup_object("mmu", None)
+        resolve = getattr(shim, "resolve_gate", None)
+        if callable(resolve):
+            try:
+                mapped = int(resolve(tool_index))
+            except Exception:
+                mapped = tool_index
+            if mapped != tool_index:
+                gcmd.respond_info(
+                    f"ACE: T{tool_index} is redirected to lane {mapped} "
+                    f"(MMU_TTG_MAP) - loading lane {mapped}")
+                tool_index = mapped
+
     if tool_index == -1:
         current_tool = manager.state.get("ace_current_index", -1)
 
@@ -1621,15 +1699,44 @@ def cmd_ACE_CHANGE_TOOL(manager, gcmd, tool_index):
             homed_axes = kin_status.get('homed_axes', '')
 
             if 'xyz' not in homed_axes:
+                # An idle load with nothing to unload moves no toolhead axis: no cut at
+                # the crossbow (nothing to cut), no brush, no prime -- the tip stops at
+                # post-gear. Homing it just to feed a bowden costs a full G28 + probe.
+                extruder = printer.lookup_object("extruder", None)
+                cold_idle = False
+                try:
+                    heater = extruder.get_heater() if extruder else None
+                    cold_idle = (
+                        current_tool == -1
+                        and not manager._is_printing_or_paused()
+                        and heater is not None
+                        and heater.get_temp(reactor.monotonic())[1] <= 0.0
+                    )
+                except Exception:
+                    cold_idle = False
+
                 gcode = printer.lookup_object("gcode")
-                gcode.respond_info("ACE: Printer not homed, homing now...")
-                gcode.run_script_from_command("G28")
+                if cold_idle:
+                    gcode.respond_info(
+                        "ACE: not homed - skipping G28, this idle load never "
+                        "moves the toolhead (tip parks at post-gear)"
+                    )
+                else:
+                    gcode.respond_info("ACE: Printer not homed, homing now...")
+                    gcode.run_script_from_command("G28")
 
         except Exception as e:
             gcode = printer.lookup_object("gcode")
             gcode.respond_info(f"ACE: Warning - could not verify homing: {e}")
 
-        status = manager.perform_tool_change(current_tool, tool_index)
+        # COLD=1: stage the lane without touching the heater -- cold park at
+        # post-gear, seat and purge deferred to the prime. Used by the start
+        # sequence's early staging; a bare T<n> never passes it.
+        manager._force_cold_load = bool(gcmd.get_int('COLD', 0))
+        try:
+            status = manager.perform_tool_change(current_tool, tool_index)
+        finally:
+            manager._force_cold_load = False
         printer.lookup_object("gcode").respond_info(f"ACE: perform_tool_change result status: {status}")
         printer.lookup_object("gcode").run_script_from_command("SET_IDLE_TIMEOUT")
         printer.lookup_object("gcode").respond_info(status)
@@ -2447,6 +2554,7 @@ ACE_COMMANDS = [
     ("ACE_FEED", cmd_ACE_FEED, "Feed filament. T=<tool> or INSTANCE= INDEX=, LENGTH=, [SPEED=]"),
     ("ACE_STOP_FEED", cmd_ACE_STOP_FEED, "Stop feeding. T=<tool> or INSTANCE= INDEX="),
     ("ACE_RETRACT", cmd_ACE_RETRACT, "Retract filament. T=<tool> or INSTANCE= INDEX=, LENGTH=, [SPEED=]"),
+    ("ACE_TANDEM_EXTRACT", cmd_ACE_TANDEM_EXTRACT, "Tandem extract until entry clears. T=, [SPEED=], [CAP=]"),
     ("ACE_STOP_RETRACT", cmd_ACE_STOP_RETRACT, "Stop retraction. T=<tool> or INSTANCE= INDEX="),
     ("ACE_SMART_UNLOAD", cmd_ACE_SMART_UNLOAD,
      "Unload filament, trys also other filament slots if sensor still triggers after unload of current tool [TOOL=]"),
@@ -2464,6 +2572,10 @@ ACE_COMMANDS = [
     ("ACE_ENABLE_ENDLESS_SPOOL", cmd_ACE_ENABLE_ENDLESS_SPOOL, "Enable endless spool"),
     ("ACE_DISABLE_ENDLESS_SPOOL", cmd_ACE_DISABLE_ENDLESS_SPOOL, "Disable endless spool"),
     ("ACE_ENDLESS_SPOOL_STATUS", cmd_ACE_ENDLESS_SPOOL_STATUS, "Query endless spool status."),
+    ("ACE_RUNOUT_MODE", cmd_ACE_RUNOUT_MODE,
+     "Set/get runout engage mode. MODE=auto|strict|prompt|off"),
+    ("ACE_RUNOUT_SWAP", cmd_ACE_RUNOUT_SWAP,
+     "Swap to TOOL=<n> after a runout (prompt button / manual)"),
     ("ACE_ENABLE_RFID_SYNC", cmd_ACE_ENABLE_RFID_SYNC, "Enable RFID inventory sync. [INSTANCE=] optional"),
     ("ACE_DISABLE_RFID_SYNC", cmd_ACE_DISABLE_RFID_SYNC, "Disable RFID inventory sync. [INSTANCE=] optional"),
     ("ACE_DEBUG", cmd_ACE_DEBUG, "Send debug request to device. INSTANCE= METHOD= [PARAMS=]"),

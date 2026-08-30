@@ -918,6 +918,37 @@ class RunoutMonitor:
             'RESPOND TYPE=command MSG="action:prompt_show"'
         )
 
+    def _show_swap_choice_prompt(self, tool_index, material, color, candidates, mode):
+        """Runout prompt with one button per lane that could take over."""
+        self.gcode.run_script_from_command(
+            'RESPOND TYPE=command MSG="action:prompt_begin Filament Runout - choose a lane"'
+        )
+        reason = ("no exact colour match" if mode == "strict" else
+                  "no automatic match" if mode == "auto" else "runout")
+        self.gcode.run_script_from_command(
+            f'RESPOND TYPE=command MSG="action:prompt_text '
+            f'T{tool_index} ({material}) ran out ({reason}). '
+            f'Swap to a lane below, or refill the bay and RESUME."'
+        )
+        for t, mat, col, exact in candidates[:4]:
+            label = f"T{t} {mat} RGB({col[0]},{col[1]},{col[2]})"
+            if exact:
+                label += " (same colour)"
+            style = "primary" if exact else "secondary"
+            self.gcode.run_script_from_command(
+                f'RESPOND TYPE=command MSG="action:prompt_button '
+                f'{label}|ACE_RUNOUT_SWAP TOOL={t}|{style}"'
+            )
+        self.gcode.run_script_from_command(
+            'RESPOND TYPE=command MSG="action:prompt_footer_button Resume|RESUME|secondary"'
+        )
+        self.gcode.run_script_from_command(
+            'RESPOND TYPE=command MSG="action:prompt_footer_button Cancel Print|CANCEL_PRINT|error"'
+        )
+        self.gcode.run_script_from_command(
+            'RESPOND TYPE=command MSG="action:prompt_show"'
+        )
+
     def _handle_runout_detected(self, tool_index):
         """
         Handle filament runout detection.
@@ -979,38 +1010,52 @@ class RunoutMonitor:
                         f"RGB({color[0]},{color[1]},{color[2]})"
                     )
 
-            # Step 3: Show simple interactive prompt
-            self._show_runout_prompt(tool_index, instance_num, local_slot, material, color)
+            # Remember the runout tool so ACE_RUNOUT_SWAP (prompt buttons,
+            # manual use) knows what it is swapping FROM.
+            self.manager.state.set("ace_runout_pending_from", tool_index)
 
-            # Step 4: Check if endless spool is enabled
-            endless_spool_enabled = self.manager.state.get("ace_endless_spool_enabled", False)
+            # Steps 3-6: the engage mode decides what happens next.
+            #   auto   - swap to the match_mode match hands-off; prompt if none
+            #   strict - auto ONLY on an exact material+colour match
+            #   prompt - always stop and offer the candidates as buttons
+            #   off    - legacy pause-only prompt
+            # Legacy mapping keeps old installs honest: enabled -> auto.
+            mode = self.manager.state.get("ace_runout_engage_mode", None)
+            if mode not in ("auto", "prompt", "strict", "off"):
+                mode = ("auto" if self.manager.state.get(
+                    "ace_endless_spool_enabled", False) else "prompt")
 
-            if not endless_spool_enabled:
-                self.gcode.respond_info(
-                    "ACE: Endless spool disabled. Staying paused. "
-                    "Refill spool and resume manually."
-                )
+            if mode == "off":
+                self._show_runout_prompt(tool_index, instance_num, local_slot, material, color)
                 return
 
-            # Step 5: Try to find exact material/color match
-            next_tool = self.endless_spool.find_exact_match(tool_index)
+            candidates = self.endless_spool.list_candidates(tool_index)
+
+            next_tool = -1
+            if mode == "auto":
+                next_tool = self.endless_spool.find_exact_match(tool_index)
+            elif mode == "strict":
+                for t, _mat, _col, exact in candidates:
+                    if exact:
+                        next_tool = t
+                        break
+
             if next_tool < 0:
-                self.gcode.respond_info(
-                    f"ACE: No endless spool match found for T{tool_index}. "
-                    f"Staying paused. Refill spool or load matching material."
-                )
+                if candidates:
+                    self._show_swap_choice_prompt(
+                        tool_index, material, color, candidates, mode)
+                else:
+                    self.gcode.respond_info(
+                        f"ACE: No ready lane can take over T{tool_index} "
+                        f"(mode: {mode}). Refill a lane, then "
+                        f"ACE_RUNOUT_SWAP TOOL=<n> or RESUME."
+                    )
+                    self._show_runout_prompt(tool_index, instance_num, local_slot, material, color)
                 return
 
-            # Step 6: Match found - close prompt and execute automatic swap
             self.gcode.respond_info(
-                f"ACE: Endless spool match found: T{tool_index} → T{next_tool}"
+                f"ACE: Runout swap ({mode}): T{tool_index} → T{next_tool}"
             )
-
-            # Close prompt before auto-swap (since we're handling it automatically)
-            self.gcode.run_script_from_command(
-                'RESPOND TYPE=command MSG="action:prompt_end"'
-            )
-
             self.endless_spool.execute_swap(tool_index, next_tool)
 
         except Exception as e:
