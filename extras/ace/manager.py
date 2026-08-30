@@ -1395,21 +1395,35 @@ class AceManager:
                 # Now: clear the toolhead with the same sensor-terminated, stall-guarded
                 # primitive ACE_LANE_PARK uses. _tandem_extract refuses to move the extruder at
                 # all until the ACE has accepted the retract, terminates on the entry switch
-                # rather than a fixed distance, and aborts after 16mm if neither the hub encoder
-                # nor the seat switch shows movement. Only once entry is sensor-confirmed clear
-                # does the long ACE-alone pull below run - on a strand nothing is gripping.
+                # rather than a fixed distance, and aborts once the post-gear switch has failed
+                # to clear over a distance no real park can need. Only once entry is
+                # sensor-confirmed clear does the long ACE-alone pull below run - on a strand
+                # nothing is gripping.
+                #
+                # No cap argument: retract_length + 80 was ~6x the toolhead geometry and had
+                # nothing to do with it. TANDEM_CAP_MM is derived from entry->postgear.
+                cleared_by_tandem = False
                 if self.get_instant_switch_state(SENSOR_TOOLHEAD):
                     try:
                         instance._tandem_extract(
                             local_slot,
                             min(float(retract_speed), 20.),
-                            abs(float(retract_length)) + 80.,
                         )
+                        cleared_by_tandem = True
                     except Exception as exc:
                         self.gcode.respond_info(
                             "ACE: smart_unload aborted - guarded toolhead clear failed on "
                             "T%s: %s" % (tool_index, exc))
                         return False
+
+                # The guarded clear ends in _stop_retract - opcode 9, the same frame that arms
+                # the device's post-STOP refusal window. The pull below then starts immediately
+                # on _retract's own MAX_RETRIES (6) x ~2s ~ 12s budget, which is inside that
+                # window: a refusal that would have cleared on its own becomes a hard unload
+                # failure mid-toolchange. STOP_SETTLE_ATTEMPTS exists for exactly this and was
+                # never applied here (2026-08-30). Only widened when a stop actually happened.
+                settle_retries = (instance.STOP_SETTLE_ATTEMPTS
+                                  if cleared_by_tandem else None)
 
                 # Start ACE retraction — use the RDM early stop only when the
                 # RDM actually sees filament right now.  Its callback stops the
@@ -1422,12 +1436,14 @@ class AceManager:
                     unload_ok = instance.rmd_triggered_unload_slot(
                         self, local_slot,
                         length=parkposition_to_toolhead_length + retract_length,
-                        overshoot_length=instance.rdm_overshoot_length
+                        overshoot_length=instance.rdm_overshoot_length,
+                        max_retries=settle_retries,
                     )
                 else:
                     unload_ok = instance._smart_unload_slot(
                         local_slot,
                         length=parkposition_to_toolhead_length + retract_length,
+                        max_retries=settle_retries,
                     )
 
                 # (No concurrent extruder move to wait for any more - the guarded clear above

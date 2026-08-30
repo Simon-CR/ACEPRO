@@ -690,7 +690,8 @@ def cmd_ACE_TANDEM_EXTRACT(gcmd):
     try:
         ace, slot = ace_get_instance_and_slot(gcmd)
         speed = gcmd.get_int("SPEED", 20)
-        cap = gcmd.get_float("CAP", 160.0)
+        # Default from the driver's own geometry, not 160: see AceInstance.TANDEM_CAP_MM.
+        cap = gcmd.get_float("CAP", ace.TANDEM_CAP_MM)
         ace._tandem_extract(slot, speed, cap)
     except Exception as e:
         gcmd.respond_info(f"ACE_TANDEM_EXTRACT error: {e}")

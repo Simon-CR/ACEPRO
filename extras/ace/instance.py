@@ -761,14 +761,21 @@ class AceInstance:
         request = self.protocol.build_unwind_filament_request(slot, length, speed)
         self.send_request(request, callback)
 
-    # Any STOP_FEED_OR_ROLLBACK leaves the device rejecting motion for ~20-30s.
-    # All three 'stop' builders emit that identical opcode-9 frame - stopping assist,
-    # stopping a feed and stopping an unwind are the SAME command on the wire - so any
-    # of them arms the window. The verified starters below retry on FORBIDDEN with a 1s
-    # pause, which makes the attempt budget the effective timeout: it must exceed the
-    # window or a caller that just stopped anything gets a spurious hard refusal.
+    # After any STOP_FEED_OR_ROLLBACK the device refuses further motion for a while. All
+    # three 'stop' builders emit that identical opcode-9 frame - stopping assist, stopping a
+    # feed and stopping an unwind are the SAME command on the wire - so any of them arms it.
+    # The refusal has been OBSERVED to last tens of seconds. Its mechanism is NOT established:
+    # a device-side timer, a second operation channel and a STOP setup race have all been
+    # proposed and none of them is verified, so nothing here asserts one. The verified
+    # starters below retry on FORBIDDEN, which makes the attempt budget the effective timeout.
+    #
+    # This is an ATTEMPT COUNT and each attempt costs a 3.0s response deadline PLUS a 1.0s
+    # pause = 4.0s. 35 attempts was therefore a ~140s budget, not the ~35s it reads as -
+    # mid-toolchange, 140s at temperature with static filament in the melt zone, a
+    # clog/heat-soak hazard the previous value of 8 (~32s) did not have. 9 bounds the worst
+    # case at ~36s, which still spans the observed refusals.
     # Costs nothing in the normal case - acceptance returns on the first attempt.
-    STOP_SETTLE_ATTEMPTS = 35
+    STOP_SETTLE_ATTEMPTS = 9
 
     def _retract_async_verified(self, slot, length, speed, max_attempts=None):
         """Start an async retract and return only once the device has ACCEPTED it.
@@ -867,7 +874,17 @@ class AceInstance:
         except Exception:
             logging.exception("ace: stop rollback assist failed")
 
-    def _tandem_extract(self, slot, speed, cap_mm):
+    # JAM CAP for the tandem pull, re-derived from the toolhead geometry 2026-08-30.
+    # entry->postgear is 20mm and both tip-forming paths leave the tip on or just below the
+    # post-gear switch (CROSSBOW parks the cut face on it via crossbow_postgear_to_blade;
+    # _TIP_SHAPING's net -48mm leaves it 3.7mm below, postgear->nozzle being 51.7mm), so a
+    # park-to-entry-clear pull is ~24mm. 48mm is 2x that.
+    # The old 140 was sized on 2026-08-21 for the alternating-chunk extraction this function
+    # REPLACED and was never re-derived; with a stall guard that could not fire (see below)
+    # it authorised ~116mm of unwitnessed grinding.
+    TANDEM_CAP_MM = 48.0
+
+    def _tandem_extract(self, slot, speed, cap_mm=None):
         """Reverse of the load crossing: both ends pull at the same speed only until
         the entry sensor CLEARS -- past that point the extruder no longer touches the
         filament, and the long pull home belongs to the ACE alone. Sensor-terminated
@@ -890,7 +907,24 @@ class AceInstance:
         The fix is to flush the motion queue before every measurement. Segments are still
         queued back-to-back so the pull stays smooth; only the CHECK waits for the machine to
         catch up. The check is also now continuous and incremental rather than one-shot.
+
+        AND IT MUST MEASURE THE STRAND, NOT THE ACE (fixed 2026-08-30). The hub encoder sits at
+        the hub and turns whenever the ACE turns - and the line below has the ACE unwinding the
+        whole cap under its own power for the entire pull - so a strand severed, buckled or
+        pinned at the toolhead NIP keeps ticking it while nothing moves at the toolhead. Letting
+        encoder pulses satisfy the check made this guard weaker than the commanded-distance
+        version it replaced: every window passed and the loop ran to cap_mm. toolhead_postgear is
+        the only sensor downstream of the extruder nip, so its transition is the only evidence
+        available here that the STRAND moved. The encoder is kept for the message only.
         """
+        if cap_mm is None:
+            cap_mm = self.TANDEM_CAP_MM
+        if cap_mm > 2. * self.TANDEM_CAP_MM:
+            self.gcode.respond_info(
+                "ACE[%d]: tandem cap %.0fmm is far above the %.0fmm the toolhead geometry "
+                "needs - it is a jam guard, not a target, and every millimetre above the "
+                "geometry is grinding this cannot stop"
+                % (self.instance_num, cap_mm, self.TANDEM_CAP_MM))
         # Accept-verified: raises before any extruder motion if the device refuses.
         self._retract_async_verified(slot, cap_mm, speed)
         toolhead = self.printer.lookup_object("toolhead")
@@ -909,18 +943,44 @@ class AceInstance:
                 return None
 
         def _seat():
+            # Deliberately NOT _seat_sensor_triggered(): that returns True when the sensor is
+            # absent, which would arm the deadline below on a machine that has no post-gear
+            # switch and abort every pull at POSTGEAR_CLEAR_MM. Absent must read as "no
+            # evidence", not as "filament".
+            if not self.seat_verify_sensor:
+                return None
+            sensor = self.printer.lookup_object(
+                "filament_switch_sensor %s" % self.seat_verify_sensor, None)
+            if sensor is None:
+                return None
             try:
-                return bool(self._seat_sensor_triggered())
+                return bool(sensor.get_status(
+                    self.reactor.monotonic()).get("filament_detected"))
             except Exception:
                 return None
 
         # Baseline is taken with the queue already drained by _retract_async_verified.
         last_enc = _enc_pulses()
-        last_seat = _seat()
+        start_seat = _seat()
+        postgear_cleared_at = None
         last_checked_at = 0.0
-        # Window over which "nothing moved anywhere" is a stall. Smaller than the old 16mm so
+        # How often the queue is drained and the switches re-read. Smaller than the old 16mm so
         # the entry-switch read below is never more than this far behind the real position.
         STALL_WINDOW_MM = 8.0
+        # If post-gear read FILAMENT when the pull started, it must read CLEAR within this much
+        # EXECUTED pull. Both tip-forming paths park within ~4mm of the switch, so this is >4x
+        # the worst real park - deliberately loose, because the switch's own release hysteresis
+        # has not been measured and a spurious abort mid-print is expensive. Falls on the second
+        # STALL_WINDOW_MM boundary, so the abort is deterministic at 16mm.
+        POSTGEAR_CLEAR_MM = 16.0
+        if start_seat is not True:
+            # Say it out loud: with no post-gear witness the cap is the ONLY thing bounding a
+            # grind on this pull.
+            self.gcode.respond_info(
+                "ACE[%d]: post-gear reads %s at the start of the tandem pull - nothing "
+                "downstream of the nip can witness the strand, so the %.0fmm cap is the only "
+                "guard" % (self.instance_num,
+                           "clear" if start_seat is False else "unavailable", cap_mm))
 
         while self.manager.get_switch_state(SENSOR_TOOLHEAD):
             err = self._confirmed_slot_error(slot)
@@ -957,26 +1017,29 @@ class AceInstance:
                 toolhead.wait_moves()
                 now_p = _enc_pulses()
                 seat_now = _seat()
-                # A switch that changed state proves the strand travelled, whatever the hub
-                # encoder says: a freshly loaded lane has slack in the bowden and the first
-                # centimetres of extraction take it up without turning the hub wheel.
-                switch_moved = (seat_now != last_seat)
-                if (last_enc is not None and now_p is not None
-                        and (now_p - last_enc) < 2 and not switch_moved):
+                if postgear_cleared_at is None and start_seat is True and seat_now is False:
+                    postgear_cleared_at = pulled
+                # THE HUB ENCODER IS NOT ADMISSIBLE HERE - see the docstring. It witnesses the
+                # ACE, which is unwinding the full cap under its own command regardless of what
+                # the strand does. The post-gear switch is downstream of the extruder nip, so
+                # its release is the one thing that proves the strand travelled. seat_now is
+                # required to be True rather than "not False" so a sensor read that fails
+                # mid-pull yields no evidence instead of a false abort.
+                if (start_seat is True and seat_now is True
+                        and pulled >= POSTGEAR_CLEAR_MM):
                     self._stop_retract(slot)
                     raise ValueError(
-                        "ACE[%d]: strand NOT moving - hub encoder saw %d pulse(s) and no switch "
-                        "change over the last %.0fmm of EXECUTED tandem pull (%.0fmm total). "
-                        "Stopping before the gears chew it further (tip_suspect: the nip is on a "
-                        "section it cannot grip - cut above entry, open the idler, eject the rest "
-                        "ACE-alone)."
-                        % (self.instance_num, (now_p - last_enc),
-                           pulled - last_checked_at, pulled))
-                # Incremental baseline: a one-shot check can never catch a stall that begins
-                # after the first window, which is how the 2026-08-27 120mm and 140mm grinds ran
-                # to the cap with the guard already satisfied and disabled.
+                        "ACE[%d]: post-gear STILL reads filament after %.0fmm of EXECUTED "
+                        "tandem pull - it must clear within %.0fmm from any park, so nothing "
+                        "downstream of the extruder nip has moved (hub encoder %+d pulses over "
+                        "the last window, which witnesses the ACE, not the strand). Either the "
+                        "strand is not moving at the nip, or the tip started far below the park. "
+                        "Stopping before the gears chew it further (cut above entry, open the "
+                        "idler, eject the rest ACE-alone)."
+                        % (self.instance_num, pulled, POSTGEAR_CLEAR_MM,
+                           ((now_p - last_enc)
+                            if (now_p is not None and last_enc is not None) else 0)))
                 last_enc = now_p
-                last_seat = seat_now
                 last_checked_at = pulled
 
         # One margin segment so the tip rests clear of the switch, not on its edge.
@@ -991,8 +1054,12 @@ class AceInstance:
         toolhead.wait_moves()
         self._stop_retract(slot)
         self.gcode.respond_info(
-            "ACE[%d]: entry cleared after %.0fmm of tandem pull - toolhead free, ACE takes it "
-            "from here" % (self.instance_num, pulled))
+            "ACE[%d]: entry cleared after %.0fmm of tandem pull (cap %.0fmm, post-gear %s) - "
+            "toolhead free, ACE takes it from here"
+            % (self.instance_num, pulled, cap_mm,
+               ("cleared at %.0fmm" % postgear_cleared_at)
+               if postgear_cleared_at is not None else
+               ("never armed" if start_seat is not True else "never cleared")))
 
     def _make_sensor_trigger_monitor(self, sensor_type):
         """
@@ -1038,7 +1105,7 @@ class AceInstance:
 
         return monitor
 
-    def _retract(self, slot, length, speed, on_retract_started=None, on_wait_for_ready=None, early_stop_callback=None):
+    def _retract(self, slot, length, speed, on_retract_started=None, on_wait_for_ready=None, early_stop_callback=None, max_retries=None):
         """
         Retract filament from slot with automatic retry on FORBIDDEN errors.
 
@@ -1053,7 +1120,11 @@ class AceInstance:
         Raises:
             ValueError: If retraction fails after all retries
         """
-        max_retries = MAX_RETRIES
+        # MAX_RETRIES (6) x the retry delay is ~12s, which is INSIDE the window in which the
+        # device refuses motion after a STOP_FEED_OR_ROLLBACK. A caller that just issued a stop
+        # must pass STOP_SETTLE_ATTEMPTS instead, or it hard-fails on a refusal that was going
+        # to clear on its own.
+        max_retries = MAX_RETRIES if max_retries is None else int(max_retries)
         # No response at all is a comms problem, and 2s is a reasonable settle for that.
         no_response_delay_s = 2.0
         # A FORBIDDEN is not a comms problem: it means the PREVIOUS move is still executing, so
@@ -2018,7 +2089,8 @@ class AceInstance:
 
         return None
 
-    def rmd_triggered_unload_slot(self, manager, slot, length, overshoot_length):
+    def rmd_triggered_unload_slot(self, manager, slot, length, overshoot_length,
+                                  max_retries=None):
         """Unload slot with RDM sensor monitoring during retraction.
 
         Monitors the RDM sensor via _retract(early_stop_callback=...) and
@@ -2090,6 +2162,7 @@ class AceInstance:
             result = self._retract(
                 slot, length, self.retract_speed,
                 early_stop_callback=rdm_early_stop_check,
+                max_retries=max_retries,
             )
         except Exception as e:
             self._stop_retract(slot)
@@ -2158,7 +2231,8 @@ class AceInstance:
             return False
         return getattr(mgr, "toolchange_in_progress", False) is True
 
-    def _smart_unload_slot(self, slot, length=100, on_retract_started=None):
+    def _smart_unload_slot(self, slot, length=100, on_retract_started=None,
+                           max_retries=None):
         """
         Fixed-length retraction with optional sensor validation.
 
@@ -2206,7 +2280,8 @@ class AceInstance:
                 length,
                 self.retract_speed,
                 on_retract_started,
-                on_wait_for_ready=sensor_monitor
+                on_wait_for_ready=sensor_monitor,
+                max_retries=max_retries,
             )
 
             elapsed_s = time.time() - start_time
