@@ -943,9 +943,17 @@ class AceInstance:
                 "FORCE_MOVE STEPPER=extruder DISTANCE=-%.1f VELOCITY=%.0f" % (seg, speed))
             pulled += seg
 
-            if last_enc is not None and (pulled - last_checked_at) >= STALL_WINDOW_MM:
+            if (pulled - last_checked_at) >= STALL_WINDOW_MM:
                 # Drain the queue FIRST. Without this the encoder is read against motion that
                 # has not happened yet, which is the bug this whole rewrite exists to fix.
+                #
+                # The drain is UNCONDITIONAL - deliberately NOT gated on having a hub encoder.
+                # It serves two purposes and only one of them is the stall check: it also bounds
+                # how stale the `while get_switch_state(SENSOR_TOOLHEAD)` read at the top of this
+                # loop can be. Gate the drain on the encoder and a machine without one runs the
+                # loop completely unpaced, so entry-clear is noticed an arbitrary distance late
+                # and the tip is dragged that much further back. Only the stall JUDGEMENT below
+                # needs the encoder.
                 toolhead.wait_moves()
                 now_p = _enc_pulses()
                 seat_now = _seat()
@@ -953,7 +961,8 @@ class AceInstance:
                 # encoder says: a freshly loaded lane has slack in the bowden and the first
                 # centimetres of extraction take it up without turning the hub wheel.
                 switch_moved = (seat_now != last_seat)
-                if now_p is not None and (now_p - last_enc) < 2 and not switch_moved:
+                if (last_enc is not None and now_p is not None
+                        and (now_p - last_enc) < 2 and not switch_moved):
                     self._stop_retract(slot)
                     raise ValueError(
                         "ACE[%d]: strand NOT moving - hub encoder saw %d pulse(s) and no switch "
