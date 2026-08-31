@@ -231,3 +231,60 @@ class TestStaleOutgoingAssistDoesNotBlindDetector:
             if "ran out at the ACE" in str(c)
         ]
         assert not msgs
+
+
+def _dialog_count(gcode):
+    return len([
+        c for c in gcode.run_script_from_command.call_args_list
+        if "prompt_begin Spool Tangle Detected" in str(c)
+    ])
+
+
+def _dialog_texts(gcode):
+    return [
+        str(c) for c in gcode.run_script_from_command.call_args_list
+        if "prompt_text Spool tangle detected" in str(c)
+    ]
+
+
+class TestTanglePromptDebounce:
+    """One tangle must not become a dialog per heartbeat.
+
+    Field case 2026-08-25: PAUSE is refused during print startup, so the
+    monitor never observed 'paused' and re-fired every second -- 35
+    identical modals in 44 s, ending in a cancelled 7h19m print.
+    """
+
+    def test_persisting_tangle_raises_one_dialog(self):
+        inst = _make_instance()
+        monitor, gcode = _make_monitor(inst, tangle_pump_time=4.0)
+        for i in range(35):
+            monitor._handle_tangle_detected(2, eventtime=100.0 + i)
+        assert _dialog_count(gcode) == 1
+        assert len(_pause_calls(gcode)) == 1
+
+    def test_second_tool_is_a_different_fault_and_raises(self):
+        inst = _make_instance()
+        monitor, gcode = _make_monitor(inst, tangle_pump_time=4.0)
+        monitor._handle_tangle_detected(2, eventtime=100.0)
+        monitor._handle_tangle_detected(3, eventtime=101.0)
+        assert _dialog_count(gcode) == 2
+
+    def test_reraise_after_cooldown_carries_the_count(self):
+        inst = _make_instance()
+        monitor, gcode = _make_monitor(inst, tangle_pump_time=4.0)
+        for i in range(30):
+            monitor._handle_tangle_detected(2, eventtime=100.0 + i)
+        monitor._handle_tangle_detected(
+            2, eventtime=100.0 + RunoutMonitor.TANGLE_PROMPT_COOLDOWN + 1.0)
+        texts = _dialog_texts(gcode)
+        assert len(texts) == 2
+        assert "Seen 31 times." in texts[1]
+
+    def test_print_stop_clears_the_latch(self):
+        inst = _make_instance()
+        monitor, gcode = _make_monitor(inst, tangle_pump_time=4.0)
+        monitor._handle_tangle_detected(2, eventtime=100.0)
+        monitor._tangle_prompt_tool = None          # what print-stop does
+        monitor._handle_tangle_detected(2, eventtime=101.0)
+        assert _dialog_count(gcode) == 2

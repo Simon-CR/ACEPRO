@@ -74,6 +74,11 @@ class RunoutMonitor:
     # give-up cap.
     DEFAULT_TANGLE_HARD_LIMIT = 8.0
     TANGLE_HARD_LIMIT_FLOOR = 6.5
+    # Duplicate-dialog suppression for the tangle prompt.  On 2026-08-25 one
+    # tangle raised 35 identical modals in 44 s: PAUSE is refused during print
+    # startup, so the monitor never saw 'paused' and re-fired every heartbeat.
+    # Detection is untouched; only the repeated response is held off.
+    TANGLE_PROMPT_COOLDOWN = 120.0
 
     def __init__(self, printer, gcode, reactor, endless_spool, manager,
                  runout_debounce_count=1, tangle_detection=False,
@@ -164,6 +169,11 @@ class RunoutMonitor:
         # dashboard pin can be flipped without going through
         # set_tangle_detection_enabled).
         self._tangle_was_active = False
+        # Tangle prompt debounce: which tool the standing dialog names, when
+        # it was raised, and how many detections it now stands for.
+        self._tangle_prompt_tool = None
+        self._tangle_prompt_at = 0.0
+        self._tangle_prompt_count = 0
         # One-shot latch for the resume-without-filament net: warn+pause
         # only once per dry resume, so a deliberate second resume proceeds.
         self._resume_no_filament_warned = False
@@ -359,6 +369,7 @@ class RunoutMonitor:
                 self._reset_tangle_phase()
                 self._resume_no_filament_warned = False
                 self.runout_handling_in_progress = False
+                self._tangle_prompt_tool = None
 
                 if not self.runout_detection_active:
                     self.gcode.respond_info("ACE: Restoring runout monitoring after print stop")
@@ -687,10 +698,10 @@ class RunoutMonitor:
             # growing sample at/above it proves filament is present and
             # blocked — pause now instead of waiting out the window.
             if current > prev and current >= self.tangle_pump_time_hard:
-                self._fire_tangle(current_tool, current)
+                self._fire_tangle(current_tool, current, eventtime)
                 return
             if eventtime - self._pt_suspect_since >= self.tangle_verify_time:
-                self._fire_tangle(current_tool, current)
+                self._fire_tangle(current_tool, current, eventtime)
             return
 
         # Cycle ended or idle: reset phase
@@ -712,12 +723,12 @@ class RunoutMonitor:
         # the verify window is disabled)
         if current >= self.tangle_pump_time:
             if self.tangle_verify_time <= 0.0:
-                self._fire_tangle(current_tool, current)
+                self._fire_tangle(current_tool, current, eventtime)
                 return
             # Already at/above the hard ceiling on the crossing sample
             # (e.g. detection re-enabled mid-tangle): no verdict needed.
             if current >= self.tangle_pump_time_hard:
-                self._fire_tangle(current_tool, current)
+                self._fire_tangle(current_tool, current, eventtime)
                 return
             # ACE2's slot state is sensor-live: a runout reports 'empty'
             # ~100 s BEFORE its starved pumping even starts, and that
@@ -727,7 +738,7 @@ class RunoutMonitor:
             # pause ~10 s sooner.  ACE1 keeps reporting 'ready' until ~4 s
             # after the crossing and must wait for the slot verdict.
             if self._slot_state_is_sensor_live(inst):
-                self._fire_tangle(current_tool, current)
+                self._fire_tangle(current_tool, current, eventtime)
                 return
             self._pt_suspect_since = eventtime
             self.gcode.respond_info(
@@ -751,7 +762,7 @@ class RunoutMonitor:
         except Exception:
             return False
 
-    def _fire_tangle(self, current_tool, current):
+    def _fire_tangle(self, current_tool, current, eventtime=None):
         """Confirmed tangle: log, wipe phase state, pause + prompt."""
         logging.warning(
             "ACE: TANGLE DETECTED on T%d — cont_assist_time=%.1fs "
@@ -761,7 +772,7 @@ class RunoutMonitor:
             self.tangle_pump_time_hard, self.tangle_verify_time,
         )
         self._reset_tangle_phase()
-        self._handle_tangle_detected(current_tool)
+        self._handle_tangle_detected(current_tool, eventtime)
 
     def _assist_slot_empty(self, inst):
         """True when the device reports the pumping slot as empty.
@@ -824,8 +835,33 @@ class RunoutMonitor:
             pass
         return None
 
-    def _handle_tangle_detected(self, tool_index):
-        """Pause the print and prompt the user to clear the tangle."""
+    def _handle_tangle_detected(self, tool_index, eventtime=None):
+        """Pause the print and prompt the user to clear the tangle.
+
+        Debounced: the same tool re-detecting inside TANGLE_PROMPT_COOLDOWN
+        bumps a counter and logs it, it does not re-open the modal or re-issue
+        PAUSE.  A different tool is a different fault and raises at once.
+        """
+        now = (eventtime if eventtime is not None
+               else self.reactor.monotonic())
+        if tool_index == self._tangle_prompt_tool:
+            self._tangle_prompt_count += 1
+            since = now - self._tangle_prompt_at
+            if since < self.TANGLE_PROMPT_COOLDOWN:
+                logging.warning(
+                    "ACE: tangle on T%d still present (detection %d, %.0fs "
+                    "since the dialog); not re-raising",
+                    tool_index, self._tangle_prompt_count, since,
+                )
+                self._reset_tangle_phase()
+                return
+        else:
+            self._tangle_prompt_count = 1
+        self._tangle_prompt_tool = tool_index
+        self._tangle_prompt_at = now
+        seen = (" Seen %d times." % self._tangle_prompt_count
+                if self._tangle_prompt_count > 1 else "")
+
         self.runout_handling_in_progress = True
         self._reset_tangle_phase()
 
@@ -843,7 +879,7 @@ class RunoutMonitor:
             )
             self.gcode.run_script_from_command(
                 f'RESPOND TYPE=command MSG="action:prompt_text '
-                f'Spool tangle detected on T{tool_index}! '
+                f'Spool tangle detected on T{tool_index}!{seen} '
                 f'ACE can\'t push filament. Check the spool, then resume."'
             )
             self.gcode.run_script_from_command(
