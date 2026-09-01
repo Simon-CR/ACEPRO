@@ -1790,14 +1790,22 @@ class TestPrepareToolheadForFilamentRetraction(unittest.TestCase):
             "_ACE_PREPARE_FOR_RETRACTION TARGET_TEMP=210 PRE_CUT_RETRACT=2.0"
         )
 
-    def test_handles_macro_failure(self):
+    def test_macro_failure_propagates(self):
+        """D-A, 2026-09-01: a failing prep macro must RAISE, not report False.
+
+        This test previously asserted the opposite - that the hook swallowed the exception
+        and returned False. That contract was the defect: neither caller checked the return,
+        so full_unload_slot went on to retract the extruder 75mm against a clamped lane after
+        the very guards meant to stop it had raised.
+        """
         manager = self._build_manager()
         manager.get_switch_state = Mock(return_value=True)
         self.mock_gcode.run_script_from_command.side_effect = Exception("boom")
 
-        result = manager.prepare_toolhead_for_filament_retraction(tool_index=0)
+        with self.assertRaises(Exception) as ctx:
+            manager.prepare_toolhead_for_filament_retraction(tool_index=0)
 
-        self.assertFalse(result)
+        self.assertIn("boom", str(ctx.exception))
 
 
 class TestSensorMonitoring(unittest.TestCase):

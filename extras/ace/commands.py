@@ -1720,6 +1720,36 @@ def cmd_ACE_CHANGE_TOOL(manager, gcmd, tool_index):
         # message when idle).
         manager.ensure_tool_slot_loaded(tool_index)
 
+        # AND CHECK THE OUTGOING LANE, WHICH IS THE ONE THAT HAS TO MOVE FIRST.
+        # ensure_tool_slot_loaded above validates the INCOMING slot only. On a toolchange the
+        # outgoing lane is extracted before the incoming one is touched, so its state decides
+        # whether the whole operation can start - and nothing was looking at it.
+        #
+        # 2026-09-01: MMU_LOAD T2 with T1 loaded. T1 had been reporting SHIFTING with feed
+        # assist running ("under tension") for seconds beforehand - visible in MMU_CHECK_GATE at
+        # 10:08:39. The change went ahead anyway: 20s of G28 + probe, a heat command for the
+        # incoming lane, and THEN a cold extraction that failed in one second. Every bit of that
+        # prep was spent on an operation that could not start.
+        #
+        # A lane mid-shift is also the direction-coherence hazard: the ACE drives it forward
+        # while the extraction pulls it back. Refusing here is cheap; discovering it at the nip
+        # is not.
+        #
+        # 'ready' only - a settled lane. shifting/feeding/preload all mean the ACE is driving it.
+        if current_tool is not None and current_tool >= 0 and current_tool != tool_index:
+            try:
+                out_inst = manager.instances[get_instance_from_tool(current_tool)]
+                out_slot = get_local_slot(current_tool, get_instance_from_tool(current_tool))
+                out_status = (out_inst._info.get("slots", [])[out_slot] or {}).get("status")
+            except Exception:
+                out_status = None
+            if out_status is not None and out_status != "ready":
+                raise gcmd.error(
+                    "ACE: T%d is '%s', not settled - the ACE is still driving that lane, and it "
+                    "has to be extracted before T%d can load. Refusing before homing rather than "
+                    "finding out at the extruder nip. Wait for it to settle, or run ACE_AUDIT."
+                    % (current_tool, out_status, tool_index))
+
         try:
             toolhead = printer.lookup_object('toolhead')
             reactor = printer.get_reactor()
@@ -1749,9 +1779,48 @@ def cmd_ACE_CHANGE_TOOL(manager, gcmd, tool_index):
                         "ACE: not homed - skipping G28, this idle load never "
                         "moves the toolhead (tip parks at post-gear)"
                     )
+                elif manager._is_printing_or_paused():
+                    # NEVER G28 MID-PRINT. Homing drives X/Y to the endstops - dragging the
+                    # nozzle across the part - and re-datums the coordinate system, so every
+                    # layer after it is offset. It does not rescue a print, it guarantees a
+                    # layer shift. Aborting leaves a part that may be rescuable; homing does
+                    # not. (Simon, 2026-09-01: "homing mid print is a recipe for layer shift,
+                    # BAD idea that should never happen pretty much.")
+                    #
+                    # Reaching here at all means PRINT_START never homed, or homing was lost
+                    # mid-print - both are upstream faults that need finding, not papering
+                    # over. Raising routes into the driver failure handler, which pauses and
+                    # raises the prompt, leaving the decision with the operator.
+                    raise gcmd.error(
+                        "ACE: toolchange requested mid-print on UNHOMED axes (homed=%r). "
+                        "REFUSING to G28 - homing now would drag the nozzle across the part "
+                        "and re-datum XY, which shifts every layer after it. PRINT_START "
+                        "should have homed before layer 1, so something upstream is broken. "
+                        "Pausing instead so the part is not destroyed by the recovery."
+                        % (homed_axes,))
                 else:
-                    gcode.respond_info("ACE: Printer not homed, homing now...")
-                    gcode.run_script_from_command("G28")
+                    # IDLE AND NOT HOMED. This is not really a toolchange - it is a manual
+                    # unload-then-load, and it must not silently G28.
+                    #
+                    # Simon, 2026-09-01: "a toolchange should only happen during a live print,
+                    # if g28 isn't done already, there's a bigger issue."
+                    #
+                    # It used to home here without being asked. That cost 20s of G28 + probe
+                    # before a T2 load that then failed at the extraction in one second - and on
+                    # a Trident the BED moves in Z, so an unrequested G28 drives the bed toward
+                    # the nozzle. An operator running a load from the panel has not consented to
+                    # that.
+                    #
+                    # Named alternatives, because a refusal that does not say what to run
+                    # instead is just an error message.
+                    raise gcmd.error(
+                        "ACE: not homed, and a toolchange from T%d to T%d needs XY - the "
+                        "cutter and the purge both move the toolhead. Idle toolchanges do not "
+                        "home themselves: on this machine the bed moves in Z, so an "
+                        "unrequested G28 moves the bed. Run G28 first if that is what you "
+                        "want. To move filament WITHOUT homing, use ACE_LANE_EJECT T=%d or "
+                        "ACE_LANE_PARK T=%d, which never touch the toolhead."
+                        % (current_tool, tool_index, current_tool, current_tool))
 
         except Exception as e:
             gcode = printer.lookup_object("gcode")
@@ -1812,7 +1881,24 @@ def cmd_ACE_CHANGE_TOOL(manager, gcmd, tool_index):
             # the "already loaded" reselection path, which trusts the poisoned
             # index, skips the real toolchange, and enables a second feed
             # assist in parallel with the still-loaded previous tool's.
-            if filament_pos in (FILAMENT_STATE_NOZZLE, FILAMENT_STATE_SPLITTER):
+            # 'toolhead' BELONGS IN THIS TUPLE. It means the tip is parked at post-gear,
+            # cold-side of the heatbreak - i.e. the previous tool is still physically in the
+            # path and its unload did NOT complete. It was missing, so a failure in that state
+            # fell to the else below and pinned the TARGET tool as current.
+            #
+            # 2026-09-01, and it cost the whole evening. A T1->T0 swap failed during T1's
+            # extraction with filament_pos='toolhead'. This wrote ace_current_index=0 while
+            # lane 1 held the strand. Everything downstream then drove the wrong lane:
+            #   - 15 presses of the failure prompt's "Retry T0" each ran a 48mm cold pull on
+            #     LANE 0, which was parked and empty-handed - 720mm of commanded unwind that
+            #     also destroyed lane 0's own park datum.
+            #   - CANCEL_PRINT armed feed assist on lane 0 while shaping lane 1's tip.
+            #   - The panel reported T0 loaded, so the operator could only find the truth by
+            #     ejecting lanes one at a time by hand.
+            # A guessed status committed as fact, which is the failure this codebase's own
+            # state-journal rule exists to prevent: commit after verified success, never before.
+            if filament_pos in (FILAMENT_STATE_NOZZLE, FILAMENT_STATE_SPLITTER,
+                                FILAMENT_STATE_TOOLHEAD):
                 active_tool = fallback_tool
             else:
                 active_tool = tool_index

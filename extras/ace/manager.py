@@ -309,6 +309,9 @@ class AceManager:
         self._last_connection_status = {}     # Track per-instance connection state
         # Instance num of the outage already paused for (one pause per outage)
         self._fast_disconnect_pause_fired = None
+        # Slots whose ACE-side feed watchdog has been armed since their last connect.
+        # Cleared on disconnect so a device that power-cycled gets re-armed.
+        self._feed_check_armed = set()
         self._shared_bus_last_connected_time = {}
         self._shared_bus_retry_timers = {}
         # Flat retry cadence - not exponential. Missing ACE2 units on the
@@ -1026,6 +1029,40 @@ class AceManager:
         except Exception as e:
             self.gcode.respond_info(f"ACE: Warning — could not turn off heater: {e}")
 
+    def _release_retraction_assists(self, reason="abort"):
+        """Drop any mode-3 rollback assist still claimed on any instance.
+
+        D-E, 2026-09-01. _ACE_PREPARE_FOR_RETRACTION hands the driver an ARMED mode 3 on
+        purpose, so the retract that follows is assisted rather than fought (see the D-D block
+        in ace.cfg). Every exit from an unload that does not go on to reach an ACE motion
+        primitive therefore left the ACE reeling backward - the assist is started with
+        length=3000 - on a strand still threaded through a hot nozzle. The shortest such path
+        is smart_unload CASE 1's "ACE slot is EMPTY" raise, which is reached a dozen lines
+        after the hook returns; the `return False` on a failed guarded toolhead clear is
+        another, and D-A adds the prep-abort path.
+
+        Only a LIVE claim is acted on, so the happy path - where _ensure_assists_off_for_motion
+        has already stopped the assist inside _retract/_feed - costs nothing and does not put
+        an extra opcode-9 STOP_FEED_OR_ROLLBACK (and its ~20-30s device refusal window) in
+        front of whatever runs next.
+        """
+        for instance in getattr(self, "instances", None) or []:
+            slot = getattr(instance, "_rollback_assist_index", -1)
+            # Instances are Mocks throughout the test suite; only a real int is a real claim.
+            if isinstance(slot, bool) or not isinstance(slot, int) or slot < 0:
+                continue
+            try:
+                self.gcode.respond_info(
+                    "ACE[%s]: releasing rollback assist on slot %d (%s) - the ACE must not be "
+                    "left reeling backward on a strand in a hot nozzle"
+                    % (getattr(instance, "instance_num", "?"), slot, reason)
+                )
+                instance._stop_rollback_assist(slot)
+            except Exception:
+                # A failure to release must never mask the failure that triggered it.
+                logging.exception(
+                    "ace: could not release rollback assist on slot %s", slot)
+
     def prepare_toolhead_for_filament_retraction(self, tool_index=-1):
         """
         Prepare toolhead (extruder/nozzle) for filament retraction.
@@ -1037,8 +1074,16 @@ class AceManager:
             tool_index: Tool to prepare for retraction (-1 = unknown tool)
 
         Returns:
-            bool: True if filament was present and handling succeeded,
-                  False if no filament present or operation completed
+            bool: True  - the prep macro ran and returned cleanly, so the
+                          toolhead is ready for the caller's retraction.
+                  False - no filament at the toolhead: there was nothing to
+                          prepare, and nothing in the toolhead to pull out of
+                          it. The caller must NOT retract the extruder on this.
+
+        Raises:
+            Whatever _ACE_PREPARE_FOR_RETRACTION raised, with its original type
+            (see the D-A block below). A raise means the prep ABORTED and the
+            caller must abort too, not retract.
         """
         if not self.get_switch_state(SENSOR_TOOLHEAD):
             self.gcode.respond_info("ACE: No filament at toolhead, skipping prep")
@@ -1060,16 +1105,24 @@ class AceManager:
             f"(target_temp={target_temp}°C) pre_cut_retract={self.pre_cut_retract_length}mm"
         )
 
-        try:
-            # Call macro to handle heating + CUT_TIP
-            self.gcode.run_script_from_command(
-                f"_ACE_PREPARE_FOR_RETRACTION TARGET_TEMP={target_temp} PRE_CUT_RETRACT={self.pre_cut_retract_length}"
-            )
-            return True
-
-        except Exception as e:
-            self.gcode.respond_info(f"ACE: Error preparing toolhead for retraction: {e}")
-            return False
+        # D-A, 2026-09-01. This was `try: ... except Exception: return False`, and NEITHER
+        # caller checked the return (smart_unload below, full_unload_slot further down). Every
+        # guard inside _ACE_PREPARE_FOR_RETRACTION was therefore ADVISORY: _ACE_REQUIRE_ASSIST,
+        # _ACE_REQUIRE_ROLLBACK_ASSIST and _ACE_ROLLBACK_ABORT could each raise, be swallowed
+        # here, and full_unload_slot would still run
+        # _extruder_move(-toolhead_retraction_length) - 75mm backward at 40mm/s against a lane
+        # the ACE clamps. That is the grind the whole mode-3 change set exists to prevent, and
+        # it happened regardless of any macro-layer work.
+        #
+        # Deliberately NOT re-wrapped in a new exception class. The macro guards raise
+        # gcode.error (klippy's CommandError); klippy/gcode.py:229-232 turns any exception that
+        # is NOT a CommandError escaping a gcode handler into printer.invoke_shutdown(). A
+        # bespoke Exception subclass here would convert a refused unload into a printer
+        # shutdown, so the original exception is allowed through untouched.
+        self.gcode.run_script_from_command(
+            f"_ACE_PREPARE_FOR_RETRACTION TARGET_TEMP={target_temp} PRE_CUT_RETRACT={self.pre_cut_retract_length}"
+        )
+        return True
 
     def _ensure_hot_for_recovery_unload(self, current_tool, target_temp):
         """Heat the extruder before a plausibility-mismatch recovery unload.
@@ -1254,6 +1307,29 @@ class AceManager:
         escalates to cycling all slots to find the blocker. Default False so
         normal print toolchange unloads never start cycling through spools.
         """
+        # D-E, 2026-09-01. A thin wrapper so that EVERY exit from the unload releases a mode-3
+        # rollback assist the prepare hook left armed: the "ACE slot is EMPTY" raise, the
+        # "Path still blocked" raise, the RDM-unload raise, the `return False` on a failed
+        # guarded toolhead clear, and the prep abort added for D-A. A wrapper rather than a
+        # try/finally around the body so the ~280-line body is not re-indented and no existing
+        # control flow is disturbed.
+        try:
+            return self._smart_unload_body(
+                tool_index=tool_index,
+                prepare_toolhead=prepare_toolhead,
+                keep_heater=keep_heater,
+                cycle_on_blocked=cycle_on_blocked,
+            )
+        finally:
+            self._release_retraction_assists("smart_unload exit")
+
+    def _smart_unload_body(self, tool_index=-1, prepare_toolhead=True, keep_heater=False,
+                           cycle_on_blocked=False):
+        """Implementation of :meth:`smart_unload`; see that method for the contract.
+
+        Split out for D-E only. Call smart_unload, not this - the wrapper owns both the
+        toolchange-depth guard and the assist release.
+        """
         current_tool_index = self.state.get("ace_current_index", -1)
 
         self.gcode.respond_info(f"ACE: Smart unload tool {tool_index} (current: {current_tool_index})")
@@ -1261,7 +1337,27 @@ class AceManager:
         tool_for_temp = tool_index if tool_index >= 0 else current_tool_index
         if prepare_toolhead:
             self.gcode.respond_info("ACE: Preparing toolhead")
-            self.prepare_toolhead_for_filament_retraction(tool_index=tool_for_temp)
+            # D-A, 2026-09-01. The return value used to be discarded outright. It is now both
+            # checked and allowed to raise. A raise means a guard inside
+            # _ACE_PREPARE_FOR_RETRACTION fired - the tip was not shaped, or the ACE refused
+            # the assist the retraction below depends on - and the unload must stop there.
+            #
+            # False is NOT a failure: it means the toolhead sensor is clear, which the
+            # sensor-clear branch of CASE 1 below already handles without moving the extruder.
+            # So only an exception aborts.
+            try:
+                prepared = self.prepare_toolhead_for_filament_retraction(
+                    tool_index=tool_for_temp)
+            except Exception as prep_exc:
+                self.gcode.respond_info(
+                    "ACE: ABORTING unload of T%s - prepare-for-retraction failed (%s). "
+                    "The toolhead was NOT prepared, so nothing here will pull on the strand."
+                    % (tool_for_temp, prep_exc))
+                raise
+            if not prepared:
+                self.gcode.respond_info(
+                    "ACE: prepare-for-retraction found nothing at the toolhead - "
+                    "continuing with the ACE-side retraction only")
 
         retract_length = self.toolhead_retraction_length
         retract_speed = self.toolhead_retraction_speed
@@ -2513,6 +2609,44 @@ class AceManager:
         except Exception:
             logging.exception("ACE: Idle flush failed")
 
+    def _arm_feed_check(self, instance):
+        """Send SET_FEED_CHECK to one instance. Returns True if it was queued.
+
+        check_length / error_length come from ace2_feed_check_length (110) and
+        ace2_feed_error_length (100) in config.py - the values the OEM host uses. They are the
+        encoder window: if the spool has not moved error_length within check_length of commanded
+        feed, the ACE stops itself.
+        """
+        protocol = getattr(instance, "protocol", None)
+        if protocol is None:
+            return False
+        try:
+            request = protocol.build_debug_request(
+                "SET_FEED_CHECK",
+                {
+                    "check_length": int(self.ace_config.get("ace2_feed_check_length", 110)),
+                    "error_length": int(self.ace_config.get("ace2_feed_error_length", 100)),
+                },
+            )
+            instance.send_high_prio_request(request, lambda response: response)
+        except Exception as exc:
+            logging.warning(
+                "ACE[%s]: failed to arm SET_FEED_CHECK: %s",
+                instance.instance_num,
+                exc,
+            )
+            return False
+        self.gcode.respond_info(
+            "ACE[%s]: feed watchdog armed (check=%s error=%s) - the ACE will halt itself "
+            "on a stalled feed instead of grinding"
+            % (
+                instance.instance_num,
+                self.ace_config.get("ace2_feed_check_length", 110),
+                self.ace_config.get("ace2_feed_error_length", 100),
+            )
+        )
+        return True
+
     def _check_connection_health(self, eventtime):
         """
         Check connection stability for all ACE instances.
@@ -2557,6 +2691,26 @@ class AceManager:
                     "time_connected": status["time_connected"],
                     "window_seconds": int(instance.serial_mgr.INSTABILITY_WINDOW),
                 })
+
+            # ARM THE ACE'S OWN FEED WATCHDOG. SET_FEED_CHECK (opcode 19) makes the ACE MCU
+            # halt its motor and report FEED_ERROR when the spool encoder stops moving during a
+            # commanded feed - i.e. it stops BEFORE the strand is ground, in hardware, without
+            # the host being involved.
+            #
+            # It was previously sent ONLY from _queue_shared_bus_instance_setup, the multi-ACE
+            # path. A single-ACE install never took that branch, so on this machine it had never
+            # been sent once - verified 2026-09-01 by grepping klippy.log for it: zero hits, ever.
+            # The protective feature the device ships with was simply never switched on, while
+            # the host reimplemented a weaker version of it in gcode macros.
+            #
+            # Armed here rather than at startup so it is re-sent after any reconnect: the ACE can
+            # lose the setting across a power cycle, and a silently disarmed watchdog is worse
+            # than none because it is trusted.
+            if status["connected"] and instance_num not in self._feed_check_armed:
+                if self._arm_feed_check(instance):
+                    self._feed_check_armed.add(instance_num)
+            elif not status["connected"]:
+                self._feed_check_armed.discard(instance_num)
 
             # Log when connection becomes stable again
             if is_stable and not was_stable and prev_status:
@@ -2988,6 +3142,26 @@ class AceManager:
                 self.gcode.run_script_from_command(
                     "SAVE_VARIABLE VARIABLE=filament_loaded_hot VALUE=1")
                 self.state.set("ace_target_index", -1)
+
+                # 2026-09-01 fix: this branch used to `return` here, never reaching
+                # the _ACE_POST_TOOLCHANGE call below -- unpark pushed filament to
+                # the nozzle and it was never purged (ground a flat into the
+                # filament on 2026-09-01). FROM=-1 = first load; PARKED=0 because
+                # the melt zone WAS just entered (PARKED=1 skips the purge and
+                # reinstates the bug). PURGED_AMOUNT credits the mm unpark_to_nozzle()
+                # already fed, so the macro doesn't double-purge it. Reads
+                # self.toolchange_purge_length/_speed directly -- the same-named
+                # locals aren't assigned yet on this path.
+                final_purge_length = self.toolchange_purge_length * self.purge_multiplier
+                self.gcode.run_script_from_command(
+                    f"_ACE_POST_TOOLCHANGE FROM=-1 TO={target_tool} "
+                    f"PURGELENGTH={final_purge_length} PURGESPEED={self.toolchange_purge_speed} "
+                    f"TARGET_TEMP={target_temp} PURGED_AMOUNT={instance.toolhead_full_purge_length:.1f} "
+                    f"PARKED=0 "
+                    f"PURGE_MAX_CHUNK_LENGTH={self.purge_max_chunk_length} "
+                    f"ENDLESS=0"
+                )
+                gcode_move.reset_last_position()
                 return f"Tool {target_tool} (unparked)"
 
             if sensor_has_filament:
@@ -4731,15 +4905,36 @@ class AceManager:
                 f"ACE[{instance_num}]: Full unload of ACTIVE tool T{tool_index}"
             )
 
+            prep_failed = False
             try:
-                self.prepare_toolhead_for_filament_retraction(tool_index=tool_index)
+                # D-A, 2026-09-01. THE call site the contract bug was about. The return was
+                # discarded and the backward _extruder_move below ran unconditionally, however
+                # _ACE_PREPARE_FOR_RETRACTION had failed - 75mm at 40mm/s against a lane the
+                # ACE clamps. Now:
+                #   * an abort inside the hook propagates and skips the move entirely;
+                #   * a False return ("no filament at the toolhead") also skips it, because
+                #     there is nothing in the toolhead to pull out and those 75mm would be
+                #     ground against an idle, clamped lane for no purpose at all.
+                try:
+                    prepared = self.prepare_toolhead_for_filament_retraction(
+                        tool_index=tool_index)
+                except Exception:
+                    prep_failed = True
+                    raise
 
-                # Extruder retract to clear the toolhead
-                self._extruder_move(
-                    -abs(self.toolhead_retraction_length),
-                    self.toolhead_retraction_speed,
-                    wait_for_move_end=True
-                )
+                if prepared:
+                    # Extruder retract to clear the toolhead
+                    self._extruder_move(
+                        -abs(self.toolhead_retraction_length),
+                        self.toolhead_retraction_speed,
+                        wait_for_move_end=True
+                    )
+                else:
+                    self.gcode.respond_info(
+                        f"ACE[{instance_num}]: Nothing at the toolhead - skipping the "
+                        f"{abs(self.toolhead_retraction_length):.0f}mm extruder retract and "
+                        f"going straight to the ACE-side pull"
+                    )
 
                 # ACE retract — _retract() polls slot sensor every ~200ms
                 # via check_slot_empty() and stops as soon as slot is empty
@@ -4775,11 +4970,26 @@ class AceManager:
                     return False
 
             except Exception as e:
+                if prep_failed:
+                    # D-A, 2026-09-01. A prep abort is a physical-safety refusal, not a
+                    # routine "unload incomplete", and must not be reported as one - the
+                    # guard's own message is the one the operator needs. Re-raised; both
+                    # callers of full_unload_slot (commands.py cmd_ACE_FULL_UNLOAD, once per
+                    # tool and once for TOOL=ALL) already catch and print it.
+                    self.gcode.respond_info(
+                        f"ACE[{instance_num}]: ABORTING full unload of T{tool_index} - "
+                        f"prepare-for-retraction failed ({e}). "
+                        f"The extruder was NOT retracted."
+                    )
+                    raise
                 self.gcode.respond_info(
                     f"ACE[{instance_num}]: Full unload of active tool failed: {e}"
                 )
                 return False
             finally:
+                # D-E, 2026-09-01: the hook hands this branch an armed mode 3 for the retract
+                # above, so every exit from here - including the `return False` - must drop it.
+                self._release_retraction_assists("full_unload_slot exit")
                 self.gcode.run_script_from_command("M104 S0")
                 self.gcode.run_script_from_command("G92 E0")
                 self.gcode.run_script_from_command("G90")

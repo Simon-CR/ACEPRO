@@ -160,6 +160,13 @@ class AceInstance:
         self._device_status_seen = False
         self.inventory = create_inventory(self.SLOT_COUNT)
         self._feed_assist_index = -1
+        # D-C, 2026-09-01. True between the mode-2 START going out and the device answering.
+        # _feed_assist_index is set optimistically before the send (the ACE2 busy/deadlock
+        # logic below needs it already set), so for that window the driver holds a claim the
+        # device has not confirmed. get_status() reports -1 while this is set: a guard reading
+        # a false NEGATIVE refuses to move, which is safe; a guard reading a false POSITIVE
+        # moves the extruder against a lane the ACE may still be clamping, which is the grind.
+        self._feed_assist_ack_pending = False
         # Mode 3. The firmware refuses mode 0/2 while this slot is rollback_assisting.
         self._rollback_assist_index = -1
         self.last_load_parked = False
@@ -443,6 +450,61 @@ class AceInstance:
                 rfid_temp = self.DEFAULT_TEMP
                 have_temp_data = False
 
+            # PLAUSIBILITY GATE. A decode that cannot be real must not be stored as if it were.
+            #
+            # The ACE parses tag bytes POSITIONALLY against Anycubic's own layout. A foreign tag
+            # in a different encoding still returns code 0, so every check upstream passes and
+            # the fields come back as garbage that merely LOOKS structured.
+            #
+            # 2026-09-01, an OpenSpool (NDEF/JSON) tag in lane 1:
+            #     sku=application/json{"   temp=28770C (min=26719, max=30821)
+            #     hotbed={'min': 8804, 'max': 8762}   color=RGB(58,34,101)
+            # `application/json` is the NDEF MIME record header being read as a SKU. That did
+            # three kinds of damage, none of which a "failed to read" would have done:
+            #   * temp fed _ACE_PRE_TOOLCHANGE, which sets the heat target from the lane's RFID
+            #     temp - 28770 as a heater target.
+            #   * the text carries DOUBLE QUOTES, and it lands inside RESPOND MSG="...", which
+            #     terminated the string early:  Malformed command 'RESPOND MSG="  T1  READY
+            #     ,"version":"1.0","t  (no spool assigned)"'
+            #   * the panel showed a spool that does not exist.
+            #
+            # Two independent tells here, and either alone is proof:
+            #   hotbed min > max   - no real tag describes an inverted range
+            #   temp far outside any hotend's working range
+            # Reject the whole decode rather than sanitising fields: a positional misparse means
+            # EVERY field came from the wrong offsets, so a field that happens to look sane is
+            # still meaningless. Treat it as no tag, which is the honest state and the one the
+            # preload search handles safely.
+            _implausible = []
+            try:
+                _hb = hotbed_temp or {}
+                _hb_min, _hb_max = _hb.get("min"), _hb.get("max")
+                if (isinstance(_hb_min, int) and isinstance(_hb_max, int)
+                        and _hb_min > _hb_max):
+                    _implausible.append("hotbed min %d > max %d" % (_hb_min, _hb_max))
+                if isinstance(rfid_temp, int) and not (0 <= rfid_temp <= 500):
+                    _implausible.append("nozzle temp %d out of range" % rfid_temp)
+                for _name, _val in (("sku", sku), ("brand", brand), ("material", material)):
+                    if isinstance(_val, str) and ('"' in _val or "\n" in _val or "\r" in _val):
+                        _implausible.append("%s contains quotes/control chars" % _name)
+            except Exception:
+                pass
+
+            if _implausible:
+                self.gcode.respond_info(
+                    "ACE[%s]: Slot %s RFID decode REJECTED (%s) - the tag is readable but is "
+                    "not in Anycubic's format, so these bytes were parsed at the wrong offsets. "
+                    "Treating the lane as untagged. Assign it with MMU_GATE_MAP GATE=%s "
+                    "SPOOLID=<n>, or write an Anycubic-format tag."
+                    % (self.instance_num, slot_idx, "; ".join(_implausible), slot_idx))
+                logging.warning(
+                    "ace: slot %s implausible RFID decode rejected (%s) raw sku=%r brand=%r "
+                    "material=%r temp=%r hotbed=%r",
+                    slot_idx, "; ".join(_implausible), sku, brand, material,
+                    rfid_temp, hotbed_temp)
+                self._pending_rfid_queries.discard(slot_idx)
+                return
+
             if 0 <= slot_idx < self.SLOT_COUNT:
                 inv = self.inventory[slot_idx]
 
@@ -597,6 +659,43 @@ class AceInstance:
         except Exception:
             return False
 
+    def _clear_assist_claims_for_slot(self, slot):
+        """Drop EVERY assist claim on `slot`, because ONE frame stops them all.
+
+        D-B, 2026-09-01. build_stop_feed_assist_request and build_stop_rollback_assist_request
+        are byte-identical - both emit STOP_FEED_OR_ROLLBACK {index} (protocol_ace2.py, where
+        the second now literally delegates to the first). Mode 2 and mode 3 are two states of
+        ONE device activity and opcode 9 ends whichever is running. The driver nevertheless
+        tracked them as two independent flags, and each stop cleared only its own: sending the
+        rollback stop on a lane where MODE 2 was live killed mode 2 on the wire and left
+        _feed_assist_index still pointing at that slot.
+
+        That stale claim is load-bearing downstream. postgear_seek.cfg gates its entire seek on
+        `feed_slot == cur` with no device-status term, and _SEEK_POSTGEAR_FAILED calls
+        ACE_DISABLE_ROLLBACK_ASSIST unconditionally on its way out - which is exactly this
+        case, on a lane the fine phase had just re-armed to mode 2. The next seek then reads
+        the stale flag as True and force-moves up to max_distance (200mm) FORWARD in 2mm steps
+        against a lane the ACE is clamping.
+
+        CHOSEN FIX: clear the state, do NOT refuse the send. Refusing to send whenever rollback
+        is not tracked as armed would re-introduce D5 (2026-08-31): _rollback_assist_index
+        resets to -1 on a klippy restart while the ACE - a separate, non-Klipper MCU - keeps
+        assisting, so ACE_DISABLE_ROLLBACK_ASSIST has to stay able to fire blind. One extra
+        stop frame is harmless; a remembered assist that is not running is not.
+        """
+        if slot is None or not isinstance(slot, int) or slot < 0:
+            return
+        if self._feed_assist_index == slot:
+            self._feed_assist_index = -1
+            self._feed_assist_topology_position = None
+            self._feed_assist_ack_pending = False
+            try:
+                self.state.set(f"ace_feed_assist_index_{self.instance_num}", -1)
+            except Exception:
+                logging.exception("ace: could not clear persisted feed assist index")
+        if self._rollback_assist_index == slot:
+            self._rollback_assist_index = -1
+
     def _enable_feed_assist(self, slot_index):
         """Enable feed assist for smooth filament loading."""
         # Mode 2 is FORBIDDEN while the slot is rollback_assisting; the firmware wants an
@@ -611,6 +710,8 @@ class AceInstance:
         self._feed_assist_topology_position = self.serial_mgr.get_usb_topology_position()
 
         def callback(response):
+            # D-C: the claim is acknowledged either way - accepted below, dropped in the else.
+            self._feed_assist_ack_pending = False
             if response and response.get("code") == 0:
                 self.gcode.respond_info(
                     f"ACE[{self.instance_num}]: Feed assist enabled on slot {slot_index}"
@@ -637,6 +738,7 @@ class AceInstance:
                 # every guard now waits a full heartbeat (>=1.1s) first, so no guard reads it.
                 self._feed_assist_index = -1
                 self._feed_assist_topology_position = None
+                self._feed_assist_ack_pending = False
                 try:
                     self.state.set(
                         f"ace_feed_assist_index_{self.instance_num}", -1
@@ -659,6 +761,10 @@ class AceInstance:
         if not (_already_assisting and self.protocol.feed_assist_causes_busy()):
             self.wait_ready()
         request = self.protocol.build_start_feed_assist_request(slot_index)
+        # D-C, 2026-09-01. Set immediately before the send and cleared by either branch of the
+        # callback. See the note in __init__ and get_status(): for the ~20ms until the ACK,
+        # status["feed_assist_slot"] reports -1 rather than an assist nothing has confirmed.
+        self._feed_assist_ack_pending = True
         self.send_request(request, callback)
         # ACE1: stays 'ready' during feed assist, so wait confirms the command was processed.
         # ACE2: transitions to 'busy' the moment feed assist starts and never returns to
@@ -681,17 +787,18 @@ class AceInstance:
             )
             return
 
-        self._feed_assist_index = -1
-        self._feed_assist_topology_position = None
+        # D-B, 2026-09-01. Was two manual assignments plus a persist inside the success
+        # callback. Routed through the shared helper so that the ONE frame this is about to
+        # send drops every claim it actually ends, and so the persisted
+        # ace_feed_assist_index_<n> is written at the same instant as the in-memory index
+        # rather than only when the device answers - the in-memory clear was already
+        # unconditional, so a persist that waited for the ACK could disagree with it forever.
+        self._clear_assist_claims_for_slot(slot_index)
 
         def callback(response):
             if response and response.get("code") == 0:
                 logging.info(
                     f"ACE[{self.instance_num}]: Feed assist disabled for slot {slot_index}"
-                )
-                self.state.set(
-                    f"ace_feed_assist_index_{self.instance_num}",
-                    -1
                 )
             else:
                 msg = response.get("msg", "Unknown") if response else ""
@@ -973,10 +1080,17 @@ class AceInstance:
                 "restart) - sending the stop for slot %d anyway"
                 % (self.instance_num, slot))
         # Cleared before the send: a STOP that throws still leaves us no claim on the slot.
-        self._rollback_assist_index = -1
+        #
+        # D-B, 2026-09-01. This used to clear ONLY _rollback_assist_index. The frame below is
+        # the same opcode-9 STOP_FEED_OR_ROLLBACK that stops mode 2, so on a lane where mode 2
+        # was live this stopped the forward assist on the wire while leaving
+        # _feed_assist_index - and therefore status["feed_assist_slot"] - claiming it was still
+        # running. _SEEK_POSTGEAR_FAILED reaches here with exactly that state. See
+        # _clear_assist_claims_for_slot for the full trace and why clearing beats refusing.
+        self._clear_assist_claims_for_slot(slot)
         try:
             request = self.protocol.build_stop_rollback_assist_request(slot)
-            self.send_request(request, lambda r: None)
+            self.send_request(request, lambda response: None)
             # Same settle as _disable_feed_assist - the device needs it before the next command.
             self.dwell(1.0)
         except Exception:
@@ -1100,11 +1214,31 @@ class AceInstance:
                     "is stopped. Pulling harder from the extruder alone would grind the filament."
                     % (self.instance_num, err, slot))
             if pulled >= cap_mm:
+                # LOOK AGAIN AFTER THE DRAIN. `pulled` counts millimetres QUEUED, not executed -
+                # the whole docstring above is about that - so reaching the cap only means the
+                # loop outran the machine. wait_moves() is where the motion actually happens, and
+                # the old code raised immediately after it without re-reading the switch. A pull
+                # that physically completed during that drain was reported as "filament is not
+                # moving back".
+                #
+                # 2026-09-01: this cost an entire evening. Extractions from a parked tip took TWO
+                # attempts - the first did the work and raised anyway, the second found entry
+                # already clear and "succeeded". No grinding at any point, which is what ruled out
+                # slip: the filament was moving exactly as commanded, and only the verdict was
+                # wrong. Same class of bug the docstring says it fixed for the STALL check; the
+                # cap check was left reading commanded distance.
+                #
+                # Simon's observation is what closed it: a cut is always followed by a park to
+                # post-gear, so a cut and a load leave the tip on the SAME edge of the same
+                # switch. Identical start position, different outcome - so it was never geometry.
                 toolhead.wait_moves()
+                if not self.manager.get_switch_state(SENSOR_TOOLHEAD):
+                    break
                 self._stop_retract(slot)
                 raise ValueError(
-                    "ACE[%d]: entry never cleared after %.0fmm of tandem pull - filament is not "
-                    "moving back" % (self.instance_num, pulled))
+                    "ACE[%d]: entry never cleared after %.0fmm of tandem pull (queue drained and "
+                    "re-checked) - filament is not moving back"
+                    % (self.instance_num, pulled))
             # FORCE_MOVE, not a planner move: the pull runs cold and the planner
             # rejects cold extrusion.
             self.gcode.run_script_from_command(
@@ -3266,7 +3400,18 @@ class AceInstance:
         status["instance"] = self.instance_num
         status["protocol"] = self.protocol_name
         status["rfid_sync_enabled"] = bool(self.rfid_inventory_sync_enabled)
-        status["feed_assist_slot"] = self._get_current_feed_assist_index()
+        # D-C, 2026-09-01. The published value must never claim an assist the device is not
+        # performing: this is what the macro guards read (_ACE_REQUIRE_ASSIST via
+        # inst.feed_assist_slot) and what postgear_seek.cfg gates 200mm of forward FORCE_MOVE
+        # on. _feed_assist_index is set optimistically before the START goes out, so until the
+        # device answers, report -1. _get_current_feed_assist_index() is deliberately NOT
+        # changed - manager.py uses it to decide whether assist is already running on a slot,
+        # and answering -1 there would re-issue an enable on a slot that is already assisting,
+        # which is the ACE2 wait_ready deadlock of 2026-08-26.
+        status["feed_assist_slot"] = (
+            -1 if self._feed_assist_ack_pending
+            else self._get_current_feed_assist_index()
+        )
         status["rollback_assist_slot"] = self._get_current_rollback_assist_index()
 
         # Attach device info from last get_info response, if available

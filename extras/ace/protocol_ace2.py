@@ -717,11 +717,18 @@ class AceProtoProtocolAdapter(AceProtocolAdapter):
         )
 
     def build_stop_rollback_assist_request(self, slot_index: int) -> Dict[str, Any]:
-        """Stop rollback assist. Same STOP as every other FEED_OR_ROLLBACK activity."""
-        return self._build_command_request(
-            "STOP_FEED_OR_ROLLBACK",
-            {"index": slot_index},
-        )
+        """Stop rollback assist -- the SAME frame that stops feed assist.
+
+        D-B, 2026-09-01. This used to be an independent copy of
+        build_stop_feed_assist_request's body, which made the two look like two commands.
+        They are one: opcode 9 STOP_FEED_OR_ROLLBACK {index} ends whichever FEED_OR_ROLLBACK
+        activity that slot is running, mode 2 or mode 3, and the device cannot be told which
+        one to stop. Delegating rather than duplicating so nothing can drift, and so the
+        identity is impossible to miss when reading either builder -- the driver tracked mode 2
+        and mode 3 as two independent flags on the strength of them looking separate here, and
+        stopped one while clearing the other's state.
+        """
+        return self.build_stop_feed_assist_request(slot_index)
 
     def build_feed_filament_request(
         self,
