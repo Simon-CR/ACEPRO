@@ -490,6 +490,21 @@ class AceInstance:
                 rfid_temp = self.DEFAULT_TEMP
                 have_temp_data = False
 
+            # V1.1.3X RAW-TAG SENTINEL, CHECKED BEFORE ANY FIELD IS TRUSTED.
+            #
+            # The firmware decodes exactly one layout and reads every field at a fixed offset
+            # after the page-4 magic. When it meets a tag it cannot decode it now says so
+            # explicitly instead of handing back a positional misparse, and caches the raw
+            # image for us. Every field in THIS response was produced by that same misparse and
+            # is meaningless, so nothing here may be stored - the real values arrive when the
+            # fetched image is parsed.
+            if int(result.get("version", 0) or 0) == self.RAW_TAG_SENTINEL:
+                self.gcode.respond_info(
+                    "ACE[%d]: Slot %d carries a non-Anycubic tag - fetching its raw image"
+                    % (self.instance_num, slot_idx))
+                self._fetch_raw_tag_image(slot_idx)
+                return
+
             # PLAUSIBILITY GATE. A decode that cannot be real must not be stored as if it were.
             #
             # The ACE parses tag bytes POSITIONALLY against Anycubic's own layout. A foreign tag
@@ -2767,6 +2782,107 @@ class AceInstance:
             except Exception:
                 pass
             raise
+
+    RAW_TAG_SENTINEL = 0x0202     # firmware V1.1.3X: "not Anycubic-format, image is cached"
+    RAW_TAG_LEN = 144             # pages 4..39
+
+    def _raw_tag_packed(self, reader, op, arg1, arg2=0):
+        """The RC522 passthrough's packed request index.
+
+        bit31 marks it as a sub-command so it lands on the stub rather than being treated as a
+        slot number - the index >= 4 rejection at 0x0800E7DA is what the stub hooks.
+        """
+        return (0x80000000 | (reader << 24) | (op << 16)
+                | ((arg1 & 0xFF) << 8) | (arg2 & 0xFF))
+
+    def _fetch_raw_tag_image(self, slot_idx):
+        """Pull the cached raw tag image back with op 9, one byte per reply, then parse it.
+
+        Only reached when the firmware reported RAW_TAG_SENTINEL, which means it read a tag
+        fine but the layout is not Anycubic's - so the positional decode it would otherwise
+        have returned is meaningless and must not be stored.
+
+        NOTHING MOVES. rawtag_stub.s copied the image into the firmware's page buffer at the
+        instant the tag was identified, so the expensive part - parking the tag on a turning
+        spool, driving the RF layer, CRC and anticollision - is already done. Reading it back
+        is pure protocol traffic.
+
+        op 9 rather than op 4: op 4 masks its offset to 6 bits and starts at BUF+64, so it can
+        only reach bytes 64..127 - exactly the range that does NOT hold the sku, brand and
+        material pages.
+
+        Chained rather than batched: each reply issues the next request, so the reactor is
+        never blocked and a device that stops answering simply stops the chain instead of
+        stalling Klipper. One byte per round trip is the protocol's shape, not a choice.
+        """
+        reader = slot_idx // 2
+        buf = bytearray(self.RAW_TAG_LEN)
+        state = {"got": 0}
+
+        def want(off):
+            req = self.protocol._build_command_request(
+                "FILAMENT_IDENTIFY", {"index": self._raw_tag_packed(reader, 9, off)})
+
+            def got(response):
+                try:
+                    val = int((response or {}).get("code", 0)) & 0xFF
+                except (TypeError, ValueError):
+                    val = 0
+                buf[off] = val
+                state["got"] += 1
+                if off + 1 < self.RAW_TAG_LEN:
+                    want(off + 1)
+                else:
+                    self._apply_raw_tag_image(slot_idx, bytes(buf))
+
+            self.send_request(req, got)
+
+        want(0)
+
+    def _apply_raw_tag_image(self, slot_idx, image):
+        """Turn the raw image into inventory fields, whatever wrote the tag."""
+        try:
+            from . import ace_tag_formats as fmts
+        except ImportError:
+            try:
+                import ace_tag_formats as fmts
+            except ImportError:
+                logging.warning("ace: ace_tag_formats not installed; raw tag image dropped")
+                return
+        try:
+            rec = fmts.parse(image)
+        except Exception:
+            logging.exception("ace: could not parse raw tag image for slot %s", slot_idx)
+            return
+
+        spool = fmts.spool_from_record(rec)
+        self.gcode.respond_info(
+            "ACE[%d]: Slot %d tag is %s format (%s) - sku=%r material=%r colour=%r%s"
+            % (self.instance_num, slot_idx, rec.get("format"), rec.get("why"),
+               rec.get("sku"), rec.get("material"), rec.get("color"),
+               (" -> spool %d" % spool) if spool is not None else " (no spool id on the tag)"))
+
+        if 0 <= slot_idx < self.SLOT_COUNT:
+            inv = self.inventory[slot_idx]
+            # A partial record is still worth storing: it renders the lane with the backend
+            # unreachable, which is the point of reading the tag rather than only trusting
+            # FilaMan. Never overwrite a good value with None.
+            if rec.get("material"):
+                inv["material"] = rec["material"]
+            if rec.get("brand"):
+                inv["brand"] = rec["brand"]
+            if rec.get("color"):
+                inv["color"] = rec["color"]
+            if rec.get("sku"):
+                inv["sku"] = str(rec["sku"])
+            if rec.get("temp_max"):
+                inv["temp"] = int(rec["temp_max"])
+            inv["tag_format"] = rec.get("format")
+            self._pending_rfid_queries.discard(slot_idx)
+            try:
+                self.manager._sync_inventory_to_persistent()
+            except Exception:
+                logging.exception("ace: could not persist raw tag inventory")
 
     def _query_rfid_full_data(self, slot_idx):
         """
