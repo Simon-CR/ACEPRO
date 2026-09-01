@@ -28,6 +28,46 @@ from .protocol import create_protocol_adapter, normalize_protocol_name, resolve_
 from .serial_manager import AceSerialManager
 
 
+def _extruder_accel(printer, default=1500.):
+    """Acceleration for FORCE_MOVE, from the printer's own extruder limit.
+
+    FORCE_MOVE defaults ACCEL to 0, and Klipper's calc_move_time treats 0 as "no ramp":
+
+        if not accel or not dist:
+            return axis_r, 0., dist / speed, speed      # accel_t = 0
+
+    The stepper is commanded straight to cruise velocity from standstill. At the tandem
+    extract's 20mm/s, with rotation_distance 47.088 and a 9:1 gear ratio, that is 229 motor
+    RPM - about 12,200 steps/s - demanded instantly at 0.6A against 900mm of loaded bowden.
+    A stepper cannot follow that, so it skips, and every FORCE_MOVE in this driver did it.
+
+    Measured 2026-09-01: a 48mm tandem pull moved 23 hub-encoder pulses (~21mm). The tip needs
+    ~20mm to get from post-gear back past entry, so it landed just short EVERY time - which is
+    the whole "unloading a parked lane takes two presses" symptom. The second press succeeded
+    because the first left the path slack, so the same instantaneous jump lost fewer steps.
+
+    max_extrude_only_accel is the machine's own answer and it is already configured (1500).
+    The ramp to 20mm/s costs 13ms and 0.13mm, so nothing here gets slower in any way that
+    matters. Note calc_move_time also clamps speed to sqrt(dist * accel) - at 1500 that is
+    77mm/s over a 4mm segment, well above anything this driver asks for, so no move is slowed.
+    """
+    try:
+        extruder = printer.lookup_object("toolhead").get_extruder()
+        accel = float(extruder.get_heater().get_status(0).get("max_extrude_only_accel", 0))
+        if accel > 0.:
+            return accel
+    except Exception:
+        pass
+    try:
+        cfg = printer.lookup_object("configfile").get_status(None)["settings"]
+        accel = float(cfg.get("extruder", {}).get("max_extrude_only_accel", 0) or 0)
+        if accel > 0.:
+            return accel
+    except Exception:
+        pass
+    return default
+
+
 class AceInstance:
     """Manages a single physical ACE Pro unit with 4 slots."""
 
@@ -1104,7 +1144,26 @@ class AceInstance:
     # The old 140 was sized on 2026-08-21 for the alternating-chunk extraction this function
     # REPLACED and was never re-derived; with a stall guard that could not fire (see below)
     # it authorised ~116mm of unwitnessed grinding.
-    TANDEM_CAP_MM = 48.0
+    # Jam cap, NOT a target - the pull is sensor-terminated when toolhead_entry clears.
+    #
+    # 48 was 2x a 24mm figure derived from ace_park_to_postgear (1510) - ace_park_to_entry (1490).
+    # Those are two ACE-FED distances measured ~900mm away through a compliant bowden; their
+    # difference is not the toolhead geometry and never was.
+    #
+    # The toolhead itself says otherwise. A single-attempt pull on 2026-09-01 00:10 logged:
+    #     entry cleared after 52mm of tandem pull (cap 48mm, post-gear cleared at 8mm)
+    # post-gear released at 8mm and entry released between 44 and 48mm, so post-gear -> entry is
+    # ~40mm. Every two-press pair on record sums to 68-76mm (48+20, 48+24, 56+20, 48+28).
+    #
+    # So the required pull sits AT the cap, and a few mm of run-to-run variation decides pass/fail.
+    # That is the two-press unload: fresh filament, any lane, no regression anywhere. It predates
+    # all of this week's work - klippy.log.2026-08-31:185585 records the identical failure at 14:02
+    # on 08-31, hours before the mode-3 commit and a day before any of these edits.
+    #
+    # Sizing to the worst case costs a healthy pull nothing, because it terminates on the switch: a
+    # pull that only needs 28mm still ends at 28mm. The real jam guard is the post-gear witness
+    # (POSTGEAR_CLEAR_MM), which aborts at 16mm when the strand never moves at all.
+    TANDEM_CAP_MM = 100.0
 
     def _tandem_extract(self, slot, speed, cap_mm=None):
         """Reverse of the load crossing: both ends pull at the same speed only until
@@ -1148,6 +1207,35 @@ class AceInstance:
                 "geometry is grinding this cannot stop"
                 % (self.instance_num, cap_mm, self.TANDEM_CAP_MM))
         # Accept-verified: raises before any extruder motion if the device refuses.
+        # A PARKED LANE ALWAYS HAS FEED ASSIST ON, so the first retract after a park is
+        # always issued into the ACE2's busy window - where it is acknowledged and IGNORED.
+        #
+        # The load arms it by design ("post-gear triggered after 24mm of crossing - engaging
+        # assist"), and it stays armed through the park. The unload disables it and commands the
+        # retract immediately afterwards. An ACE2 is busy for as long as assist is active and
+        # silently ignores feed/retract for EVERY slot until STOP_FEED_ASSIST has taken effect.
+        #
+        # That is why a parked unload was perfectly reproducibly a TWO-PRESS operation: the
+        # first press was spent inside that window with its retract discarded and the extruder
+        # pulling alone against a clamped lane (measured: enc +0 for the full 48mm), and the
+        # second press found assist already off and completed in 20-28mm.
+        #
+        # A settle DELAY, not a status read. An earlier attempt polled _info["status"], which
+        # comes from the 1 Hz heartbeat and was therefore up to a second stale - it read the
+        # PRE-disable status, passed instantly, and changed nothing. One heartbeat is 1.0s, so
+        # waiting past that guarantees any status we then see is fresh.
+        #
+        # Bounded and never fatal. ~1.2s on an operation that takes tens of seconds.
+        if getattr(self.protocol, "feed_assist_causes_busy", lambda: False)():
+            self.reactor.pause(self.reactor.monotonic() + 1.2)
+            _deadline = self.reactor.monotonic() + 2.0
+            while (self._info.get("status") != "ready"
+                   and self.reactor.monotonic() < _deadline):
+                self.reactor.pause(self.reactor.monotonic() + 0.2)
+            self.gcode.respond_info(
+                "ACE[%d]: settled for the assist stop before retracting (device now '%s')"
+                % (self.instance_num, self._info.get("status")))
+
         self._retract_async_verified(slot, cap_mm, speed)
         toolhead = self.printer.lookup_object("toolhead")
         pulled = 0.0
@@ -1242,7 +1330,8 @@ class AceInstance:
             # FORCE_MOVE, not a planner move: the pull runs cold and the planner
             # rejects cold extrusion.
             self.gcode.run_script_from_command(
-                "FORCE_MOVE STEPPER=extruder DISTANCE=-%.1f VELOCITY=%.0f" % (seg, speed))
+                "FORCE_MOVE STEPPER=extruder DISTANCE=-%.1f VELOCITY=%.0f ACCEL=%.0f"
+                % (seg, speed, _extruder_accel(self.printer)))
             pulled += seg
 
             if (pulled - last_checked_at) >= STALL_WINDOW_MM:
@@ -1259,8 +1348,44 @@ class AceInstance:
                 toolhead.wait_moves()
                 now_p = _enc_pulses()
                 seat_now = _seat()
+                # INSTRUMENTATION 2026-09-01. Four theories for "a parked unload always takes
+                # two attempts" fitted the end state and were all wrong: slack take-up, a
+                # queue race, a chewed strand, and the ACE unwind finishing early. Each was
+                # inferred from where the pull ENDED. What nothing records is WHEN the strand
+                # stops following - so measure that instead of guessing again.
+                #
+                # Per window: commanded mm, hub-encoder delta (witnesses the ACE turning) and
+                # the post-gear seat (witnesses the strand actually translating past the nip).
+                # A failed attempt then answers it directly:
+                #   encoder advancing, seat static  -> the ACE turns, the strand does not follow
+                #   encoder static                  -> the ACE stopped or never accepted
+                #   both advancing to the cap       -> it really is travelling and the cap is short
+                _d = ((now_p - last_enc)
+                      if (now_p is not None and last_enc is not None) else None)
+                self.gcode.respond_info(
+                    "ACE[%d]: [pull] %.0fmm commanded | enc %s (%s total) | post-gear %s"
+                    % (self.instance_num, pulled,
+                       ("%+d pulses" % _d) if _d is not None else "n/a",
+                       now_p if now_p is not None else "n/a",
+                       "MADE" if seat_now else ("clear" if seat_now is False else "n/a")))
                 if postgear_cleared_at is None and start_seat is True and seat_now is False:
                     postgear_cleared_at = pulled
+                    # REVERTED 2026-09-01. Two changes lived here for about an hour and both
+                    # are gone:
+                    #
+                    #   1. rebasing cap_mm on this moment, on the theory that a parked start
+                    #      spends its first stroke taking up slack.
+                    #   2. re-issuing the ACE unwind to match the longer cap.
+                    #
+                    # (2) actively broke the pull. The instrumentation caught it: the strand
+                    # moved 8mm, the extension fired at exactly 8mm, and then NOTHING moved for
+                    # the next 48mm - a second retract command issued while one is already
+                    # running evidently disrupts it. Before these changes the unload took two
+                    # presses; after them the first press could not move the strand at all.
+                    #
+                    # The design is tandem retraction until the ENTRY sensor clears. Do not add
+                    # commands inside that loop without hardware evidence they help.
+
                 # THE HUB ENCODER IS NOT ADMISSIBLE HERE - see the docstring. It witnesses the
                 # ACE, which is unwinding the full cap under its own command regardless of what
                 # the strand does. The post-gear switch is downstream of the extruder nip, so
@@ -1286,7 +1411,8 @@ class AceInstance:
 
         # One margin segment so the tip rests clear of the switch, not on its edge.
         self.gcode.run_script_from_command(
-            "FORCE_MOVE STEPPER=extruder DISTANCE=-%.1f VELOCITY=%.0f" % (seg, speed))
+            "FORCE_MOVE STEPPER=extruder DISTANCE=-%.1f VELOCITY=%.0f ACCEL=%.0f"
+                % (seg, speed, _extruder_accel(self.printer)))
         pulled += seg
         # Let the extruder actually FINISH before the ACE is told to stop. Previously the ACE
         # was stopped while up to BUFFER_TIME_HIGH * speed (~20mm) of extruder retraction was
@@ -1746,8 +1872,8 @@ class AceInstance:
                             f"stopped its own motor. Check the lane."
                         )
                     self.gcode.run_script_from_command(
-                        "FORCE_MOVE STEPPER=extruder DISTANCE=%.1f VELOCITY=%.0f"
-                        % (self.RELEASE_CHUNK_MM, extruder_feeding_speed))
+                        "FORCE_MOVE STEPPER=extruder DISTANCE=%.1f VELOCITY=%.0f ACCEL=%.0f"
+                        % (self.RELEASE_CHUNK_MM, extruder_feeding_speed, _extruder_accel(self.printer)))
                     pushed += self.RELEASE_CHUNK_MM
                     # Same drain as the normal crossing: `pushed` must mean executed, not
                     # queued, or the per-chunk device-fault check below runs against motion
@@ -1786,8 +1912,8 @@ class AceInstance:
                     # cold load, 2026-08-23 -- every earlier crossing had a hot nozzle
                     # masking it). Same rule as the tandem extract.
                     self.gcode.run_script_from_command(
-                        "FORCE_MOVE STEPPER=extruder DISTANCE=%.1f VELOCITY=%.0f"
-                        % (self.RELEASE_CHUNK_MM, extruder_feeding_speed))
+                        "FORCE_MOVE STEPPER=extruder DISTANCE=%.1f VELOCITY=%.0f ACCEL=%.0f"
+                        % (self.RELEASE_CHUNK_MM, extruder_feeding_speed, _extruder_accel(self.printer)))
                     crossed += self.RELEASE_CHUNK_MM
                     # CROSSING LOOPS MUST READ THE SENSOR AGAINST REAL POSITION (2026-08-30).
                     # FORCE_MOVE does not block, so without this drain `crossed` counts
