@@ -4745,10 +4745,19 @@ class AceManager:
                 # via check_slot_empty() and stops as soon as slot is empty
                 if not instance.protocol.feed_assist_causes_busy():
                     instance.wait_ready()
+                # max_retries, 2026-08-31. As of today the hook above deliberately LEAVES mode 3
+                # armed so the 75mm extruder retract between it and this line is assisted (see
+                # the D1/D2 block in ace.cfg). _retract() therefore always disarms it itself, via
+                # _ensure_assists_off_for_motion, and that emits opcode 9 STOP_FEED_OR_ROLLBACK -
+                # which arms the ~20-30s window in which the device refuses motion, immediately
+                # in front of this retract. The default MAX_RETRIES (6) x a 2.0s cap is a ~12s
+                # budget that expires INSIDE that window, exactly as _retract's own docstring
+                # warns. STOP_SETTLE_ATTEMPTS is the budget sized to outlast it.
                 instance._retract(
                     local_slot,
                     length=instance.total_max_feeding_length,
                     speed=instance.retract_speed,
+                    max_retries=instance.STOP_SETTLE_ATTEMPTS,
                 )
 
                 if instance._last_retract_early_stopped:

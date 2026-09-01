@@ -160,6 +160,8 @@ class AceInstance:
         self._device_status_seen = False
         self.inventory = create_inventory(self.SLOT_COUNT)
         self._feed_assist_index = -1
+        # Mode 3. The firmware refuses mode 0/2 while this slot is rollback_assisting.
+        self._rollback_assist_index = -1
         self.last_load_parked = False
         # Slot with a load in flight. ace_current_index only flips at load END, so the
         # single-assist invariant below would read the incoming lane's assist as stale
@@ -547,6 +549,10 @@ class AceInstance:
         """Get the current feed assist slot index (-1 if disabled)."""
         return self._feed_assist_index
 
+    def _get_current_rollback_assist_index(self):
+        """Get the current rollback assist slot index (-1 if disabled)."""
+        return self._rollback_assist_index
+
     def _is_slot_empty(self, slot_index):
         """Return True if ACE reports the given slot as empty."""
         for slot in self._info.get("slots", []):
@@ -593,6 +599,10 @@ class AceInstance:
 
     def _enable_feed_assist(self, slot_index):
         """Enable feed assist for smooth filament loading."""
+        # Mode 2 is FORBIDDEN while the slot is rollback_assisting; the firmware wants an
+        # explicit STOP between the two assists.
+        if self._rollback_assist_index >= 0:
+            self._stop_rollback_assist(self._rollback_assist_index)
         # Captured BEFORE the assignment below overwrites it: on ACE2 an assist that is
         # already running is itself what holds the device 'busy', so the leading
         # wait_ready() must not wait on it. See the guard below.
@@ -611,6 +621,32 @@ class AceInstance:
                 )
             else:
                 msg = response.get("msg", "Unknown") if response else ""
+                # D6, 2026-08-31. The index is set optimistically BEFORE the send (ACE2 goes
+                # 'busy' the instant assist starts, and the busy/deadlock logic below needs it
+                # already set). Until today a device REJECTION only reached logging.warning, so
+                # the optimistic value stood forever: status["feed_assist_slot"] reported an
+                # assist the device had refused, and _ACE_REQUIRE_ASSIST - whose whole job is to
+                # prove the ACE will follow the extruder - passed against a lane assisting
+                # nothing. Roll the claim back here so the refusal is visible to the guard.
+                #
+                # NOT converted to the blocking accept-then-set loop that
+                # _start_rollback_assist_verified uses: that shape needs send_request to invoke
+                # its callback, and _enable_feed_assist has ~70 call sites across 9 test modules
+                # that mock send_request as a bare Mock() which never calls back, so each would
+                # burn the full response deadline. The residual window is the ~20ms to the ACK;
+                # every guard now waits a full heartbeat (>=1.1s) first, so no guard reads it.
+                self._feed_assist_index = -1
+                self._feed_assist_topology_position = None
+                try:
+                    self.state.set(
+                        f"ace_feed_assist_index_{self.instance_num}", -1
+                    )
+                except Exception:
+                    logging.exception("ace: could not clear persisted feed assist index")
+                self.gcode.respond_info(
+                    f"ACE[{self.instance_num}]: Feed assist enable REFUSED by the device on "
+                    f"slot {slot_index} ({msg}) - assist claim dropped, do NOT move the extruder"
+                )
                 logging.warning(
                     f"ACE[{self.instance_num}]: Feed assist enable failed: {msg}"
                 )
@@ -679,8 +715,8 @@ class AceInstance:
         if not self.protocol.feed_assist_causes_busy():
             self.wait_ready()
 
-    def _ensure_feed_assist_off_for_motion(self, slot, action):
-        """Disable any active feed assist before a FEED/RETRACT command.
+    def _ensure_assists_off_for_motion(self, slot, action, keep_rollback_slot=-1):
+        """Disable any active feed OR rollback assist before a FEED/RETRACT command.
 
         ACE2 stays 'busy' the whole time feed assist is active and silently
         ignores feed/retract commands for ANY slot on the same device
@@ -690,19 +726,31 @@ class AceInstance:
         about to move, which no-ops in _disable_feed_assist when the assist
         is on a different slot. This guard runs in every motion primitive
         so no call path can send motion into a device blocked by assist.
+        Mode 3 blocks the same way and additionally OPPOSES a forward feed,
+        so a live rollback assist is cleared here too.
+
+        keep_rollback_slot spares a rollback assist on that slot; only
+        _start_rollback_assist_verified passes it, so the guard can never
+        stop the assist it is about to start.
         """
         active = self._feed_assist_index
-        if active < 0:
-            return
-        self.gcode.respond_info(
-            f"ACE[{self.instance_num}]: Feed assist active on slot {active} - "
-            f"disabling before {action} on slot {slot}"
-        )
-        self._disable_feed_assist(active)
+        if active >= 0:
+            self.gcode.respond_info(
+                f"ACE[{self.instance_num}]: Feed assist active on slot {active} - "
+                f"disabling before {action} on slot {slot}"
+            )
+            self._disable_feed_assist(active)
+        rollback = self._rollback_assist_index
+        if rollback >= 0 and rollback != keep_rollback_slot:
+            self.gcode.respond_info(
+                f"ACE[{self.instance_num}]: Rollback assist active on slot {rollback} - "
+                f"disabling before {action} on slot {slot}"
+            )
+            self._stop_rollback_assist(rollback)
 
     def _feed(self, slot, length, speed, callback=None):
         """Feed filament from slot."""
-        self._ensure_feed_assist_off_for_motion(slot, "feed")
+        self._ensure_assists_off_for_motion(slot, "feed")
         self.gcode.respond_info(
             f"ACE[{self.instance_num}]: _feed() -> slot={slot}, "
             f"length={length}mm, speed={speed}mm/s"
@@ -743,7 +791,7 @@ class AceInstance:
         _retract serialised the park's 'simultaneous' pull into one end after the other
         (observed 04:53-04:54 on 2026-08-23); both ends must genuinely move together.
         """
-        self._ensure_feed_assist_off_for_motion(slot, "retract")
+        self._ensure_assists_off_for_motion(slot, "retract")
         if self._is_slot_empty(slot):
             self.gcode.respond_info(
                 f"ACE[{self.instance_num}]: Async retract skipped - slot {slot} is empty"
@@ -769,13 +817,28 @@ class AceInstance:
     # proposed and none of them is verified, so nothing here asserts one. The verified
     # starters below retry on FORBIDDEN, which makes the attempt budget the effective timeout.
     #
-    # This is an ATTEMPT COUNT and each attempt costs a 3.0s response deadline PLUS a 1.0s
-    # pause = 4.0s. 35 attempts was therefore a ~140s budget, not the ~35s it reads as -
-    # mid-toolchange, 140s at temperature with static filament in the melt zone, a
-    # clog/heat-soak hazard the previous value of 8 (~32s) did not have. 9 bounds the worst
-    # case at ~36s, which still spans the observed refusals.
+    # This is an ATTEMPT COUNT and each attempt costs a response deadline PLUS a pause.
+    # 35 attempts was a ~140s budget, not the ~35s it reads as - mid-toolchange, 140s at
+    # temperature with static filament in the melt zone, a clog/heat-soak hazard.
+    #
+    # D7, 2026-08-31. The old arithmetic above ("9 bounds the worst case at ~36s") only held
+    # for the NO-RESPONSE case, where each attempt really does burn the full 3.0s deadline.
+    # The case this budget actually exists for is the opposite one: inside the refuse window
+    # the device answers FORBIDDEN promptly (~20ms), so an attempt cost ~1.02s and 9 attempts
+    # spanned only ~9s - SHORTER than the 20-30s window it was sized to ride out. The starter
+    # then raised on a refusal that was about to clear on its own.
+    #
+    # Fixed by making the pause depend on WHY the attempt failed (see STOP_SETTLE_*_PAUSE_S):
+    #   FORBIDDEN / device error : ~0.02s + 3.0s pause  -> 12 attempts ~= 36s, spans the window
+    #   no response at all       : 3.0s deadline + 0.5s -> 12 attempts ~= 42s, comms fault
+    # Both still bound time-at-temperature to well under the old 140s.
     # Costs nothing in the normal case - acceptance returns on the first attempt.
-    STOP_SETTLE_ATTEMPTS = 9
+    STOP_SETTLE_ATTEMPTS = 12
+    # A FORBIDDEN means the device is inside its post-STOP refuse window; the only useful
+    # response is to wait a meaningful slice of that window before asking again.
+    STOP_SETTLE_REFUSED_PAUSE_S = 3.0
+    # No response is a comms problem, and the 3.0s deadline has already elapsed.
+    STOP_SETTLE_SILENT_PAUSE_S = 0.5
 
     def _retract_async_verified(self, slot, length, speed, max_attempts=None):
         """Start an async retract and return only once the device has ACCEPTED it.
@@ -790,7 +853,7 @@ class AceInstance:
         """
         if max_attempts is None:
             max_attempts = self.STOP_SETTLE_ATTEMPTS
-        self._ensure_feed_assist_off_for_motion(slot, "retract")
+        self._ensure_assists_off_for_motion(slot, "retract")
         if self._is_slot_empty(slot):
             raise ValueError(
                 f"ACE[{self.instance_num}]: tandem retract refused - slot {slot} is empty")
@@ -814,7 +877,11 @@ class AceInstance:
             self.gcode.respond_info(
                 f"ACE[{self.instance_num}]: tandem retract not accepted "
                 f"(attempt {attempt}/{max_attempts}: {why}) - extruder held still")
-            self.reactor.pause(self.reactor.monotonic() + 1.0)
+            # See STOP_SETTLE_ATTEMPTS: a prompt FORBIDDEN needs the long pause, silence
+            # does not (its deadline already elapsed).
+            self.reactor.pause(self.reactor.monotonic() + (
+                self.STOP_SETTLE_SILENT_PAUSE_S if resp is None
+                else self.STOP_SETTLE_REFUSED_PAUSE_S))
         raise ValueError(
             f"ACE[{self.instance_num}]: device refused the tandem retract {max_attempts}x "
             f"({why}) - aborting BEFORE the extruder pulls against a clamped lane")
@@ -835,7 +902,8 @@ class AceInstance:
         """
         if max_attempts is None:
             max_attempts = self.STOP_SETTLE_ATTEMPTS
-        self._ensure_feed_assist_off_for_motion(slot, "rollback assist")
+        self._ensure_assists_off_for_motion(slot, "rollback assist",
+                                            keep_rollback_slot=slot)
         if self._is_slot_empty(slot):
             raise ValueError(
                 "ACE[%d]: rollback assist refused - slot %d is empty"
@@ -855,12 +923,18 @@ class AceInstance:
                 self.reactor.pause(self.reactor.monotonic() + 0.1)
             resp = rc["response"]
             if resp and resp.get("code", 0) == 0 and resp.get("msg") != "FORBIDDEN":
+                # Only now is mode 3 live; the macro layer gates its retracts on this.
+                self._rollback_assist_index = slot
                 return
             why = "no response" if not resp else resp.get("msg", "error")
             self.gcode.respond_info(
                 "ACE[%d]: rollback assist not accepted (attempt %d/%d: %s) - extruder held still"
                 % (self.instance_num, attempt, max_attempts, why))
-            self.reactor.pause(self.reactor.monotonic() + 1.0)
+            # See STOP_SETTLE_ATTEMPTS: a prompt FORBIDDEN needs the long pause, silence
+            # does not (its deadline already elapsed).
+            self.reactor.pause(self.reactor.monotonic() + (
+                self.STOP_SETTLE_SILENT_PAUSE_S if resp is None
+                else self.STOP_SETTLE_REFUSED_PAUSE_S))
         raise ValueError(
             "ACE[%d]: device refused rollback assist %dx (%s) - aborting BEFORE the extruder "
             "pulls against a lane that is not assisting" % (self.instance_num, max_attempts, why))
@@ -868,9 +942,43 @@ class AceInstance:
     def _stop_rollback_assist(self, slot):
         """End mode-3 assist. Uses the shared STOP; callers must respect the ~20-30s window in
         which the device rejects further motion after a STOP_FEED_OR_ROLLBACK."""
+        if slot < 0:
+            return
+        # D5, 2026-08-31. This used to return WITHOUT SENDING whenever the tracked index did not
+        # match. _rollback_assist_index initialises to -1 (see __init__) and the ACE is a
+        # separate, non-Klipper MCU that keeps assisting across a klippy restart - so after a
+        # FIRMWARE_RESTART the driver believes mode 3 is off while the device is still reeling
+        # backward, and ACE_DISABLE_ROLLBACK_ASSIST - the exact command every rollback error
+        # message tells the operator to run - was a silent no-op.
+        #
+        # CHOSEN FIX: always send when the tracked index is UNKNOWN (-1), rather than persisting
+        # the index the way feed assist does in ace_feed_assist_index_<n>. Persist-and-restore is
+        # right for mode 2 because a dropped forward assist is a loss worth repairing; mode 3 is
+        # the opposite. We never want to RE-ARM a backward assist unattended after a restart - we
+        # only ever want a guarantee that it is OFF. So the fail-safe here is an extra, harmless
+        # stop frame, not remembered state that could resurrect reverse motion on a strand
+        # threaded through a hot nozzle. A stop on a slot that was not assisting is accepted by
+        # the device and costs only the settle dwell below.
+        #
+        # A tracked index pointing at a DIFFERENT slot is still a real mismatch: that assist is
+        # someone else's and stopping it here would be the bug this guard exists to prevent.
+        if self._rollback_assist_index >= 0 and self._rollback_assist_index != slot:
+            logging.warning(
+                "ACE[%d]: Rollback assist tracked on slot %d, not %d - not stopping"
+                % (self.instance_num, self._rollback_assist_index, slot))
+            return
+        if self._rollback_assist_index < 0:
+            logging.info(
+                "ACE[%d]: Rollback assist state unknown (index -1, e.g. after a klippy "
+                "restart) - sending the stop for slot %d anyway"
+                % (self.instance_num, slot))
+        # Cleared before the send: a STOP that throws still leaves us no claim on the slot.
+        self._rollback_assist_index = -1
         try:
             request = self.protocol.build_stop_rollback_assist_request(slot)
             self.send_request(request, lambda r: None)
+            # Same settle as _disable_feed_assist - the device needs it before the next command.
+            self.dwell(1.0)
         except Exception:
             logging.exception("ace: stop rollback assist failed")
 
@@ -1140,7 +1248,7 @@ class AceInstance:
 
         # Must run BEFORE wait_ready(): with assist active, ACE2 is 'busy'
         # by design and wait_ready() would stall without this.
-        self._ensure_feed_assist_off_for_motion(slot, "retract")
+        self._ensure_assists_off_for_motion(slot, "retract")
 
         self.wait_ready()
         self._last_retract_early_stopped = False
@@ -2024,7 +2132,7 @@ class AceInstance:
         Returns:
             dict: Response from ACE
         """
-        self._ensure_feed_assist_off_for_motion(slot, "feed (sync)")
+        self._ensure_assists_off_for_motion(slot, "feed (sync)")
         self.gcode.respond_info(
             f"ACE[{self.instance_num}]: feed_filament_with_wait_for_response() -> slot={slot}, "
             f"length={length}mm, speed={speed}mm/s"
@@ -3159,6 +3267,7 @@ class AceInstance:
         status["protocol"] = self.protocol_name
         status["rfid_sync_enabled"] = bool(self.rfid_inventory_sync_enabled)
         status["feed_assist_slot"] = self._get_current_feed_assist_index()
+        status["rollback_assist_slot"] = self._get_current_rollback_assist_index()
 
         # Attach device info from last get_info response, if available
         device_info = getattr(self.serial_mgr, "device_info", {})

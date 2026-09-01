@@ -905,6 +905,33 @@ def cmd_ACE_DISABLE_FEED_ASSIST(gcmd):
     gcmd.respond_info(f"Feed assist disabled for slot {slot}")
 
 
+def cmd_ACE_ENABLE_ROLLBACK_ASSIST(gcmd):
+    """Enable rollback (reverse) assist. T=<tool> or INSTANCE= INDEX="""
+    ace, slot = ace_get_instance_and_slot(gcmd)
+
+    if not (0 <= slot < ace.SLOT_COUNT):
+        raise gcmd.error(f"Invalid slot {slot}")
+
+    # Must abort the caller, not just log it: a refused assist means the extruder
+    # must not retract.
+    try:
+        ace._start_rollback_assist_verified(slot)
+    except ValueError as e:
+        raise gcmd.error(str(e))
+    gcmd.respond_info(f"Rollback assist enabled for slot {slot}")
+
+
+def cmd_ACE_DISABLE_ROLLBACK_ASSIST(gcmd):
+    """Disable rollback assist. T=<tool> or INSTANCE= INDEX="""
+    ace, slot = ace_get_instance_and_slot(gcmd)
+
+    if not (0 <= slot < ace.SLOT_COUNT):
+        raise gcmd.error(f"Invalid slot {slot}")
+
+    ace._stop_rollback_assist(slot)
+    gcmd.respond_info(f"Rollback assist disabled for slot {slot}")
+
+
 def cmd_ACE_SET_PURGE_AMOUNT(gcmd):
     """
     Set purge amount and speed for next toolchange.
@@ -2568,6 +2595,8 @@ ACE_COMMANDS = [
     ("ACE_STOP_DRYING", cmd_ACE_STOP_DRYING, "Stop dryer. [INSTANCE=]"),
     ("ACE_ENABLE_FEED_ASSIST", cmd_ACE_ENABLE_FEED_ASSIST, "Enable feed assist. T=<tool> or INSTANCE= INDEX="),
     ("ACE_DISABLE_FEED_ASSIST", cmd_ACE_DISABLE_FEED_ASSIST, "Disable feed assist. T=<tool> or INSTANCE= INDEX="),
+    ("ACE_ENABLE_ROLLBACK_ASSIST", cmd_ACE_ENABLE_ROLLBACK_ASSIST, "Enable rollback (reverse) assist - ACE follows an extruder RETRACT. T=<tool> or INSTANCE= INDEX="),
+    ("ACE_DISABLE_ROLLBACK_ASSIST", cmd_ACE_DISABLE_ROLLBACK_ASSIST, "Disable rollback assist. T=<tool> or INSTANCE= INDEX="),
     ("ACE_SET_PURGE_AMOUNT", cmd_ACE_SET_PURGE_AMOUNT, "Set purge parameters. PURGELENGTH= PURGESPEED= [INSTANCE=]"),
     ("ACE_QUERY_SLOTS", cmd_ACE_QUERY_SLOTS, "Query slots. INSTANCE= (omit to query all)"),
     ("ACE_ENABLE_ENDLESS_SPOOL", cmd_ACE_ENABLE_ENDLESS_SPOOL, "Enable endless spool"),

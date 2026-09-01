@@ -75,6 +75,8 @@ def mock_ace_instance():
     instance._stop_retract = Mock()
     instance._enable_feed_assist = Mock()
     instance._disable_feed_assist = Mock()
+    instance._start_rollback_assist_verified = Mock()
+    instance._stop_rollback_assist = Mock()
     instance._dryer_active = False
     instance._dryer_temperature = 0
     instance._dryer_duration = 0
@@ -1263,6 +1265,22 @@ class TestDryingCommands:
         
         ace.commands.cmd_ACE_DISABLE_FEED_ASSIST(mock_gcmd)
         assert ACE_INSTANCES[0]._disable_feed_assist.called
+
+    def test_cmd_ACE_ENABLE_ROLLBACK_ASSIST(self, mock_gcmd, setup_mocks):
+        """Test ACE_ENABLE_ROLLBACK_ASSIST."""
+        mock_gcmd.get_command_parameters = Mock(return_value={"INSTANCE": 0, "INDEX": 0})
+        mock_gcmd.get_int = Mock(side_effect=[0, 0])
+
+        ace.commands.cmd_ACE_ENABLE_ROLLBACK_ASSIST(mock_gcmd)
+        ACE_INSTANCES[0]._start_rollback_assist_verified.assert_called_once_with(0)
+
+    def test_cmd_ACE_DISABLE_ROLLBACK_ASSIST(self, mock_gcmd, setup_mocks):
+        """Test ACE_DISABLE_ROLLBACK_ASSIST."""
+        mock_gcmd.get_command_parameters = Mock(return_value={"INSTANCE": 0, "INDEX": 0})
+        mock_gcmd.get_int = Mock(side_effect=[0, 0])
+
+        ace.commands.cmd_ACE_DISABLE_ROLLBACK_ASSIST(mock_gcmd)
+        ACE_INSTANCES[0]._stop_rollback_assist.assert_called_once_with(0)
 
     def test_cmd_ACE_SET_PURGE_AMOUNT(self, mock_gcmd, setup_mocks):
         """Test ACE_SET_PURGE_AMOUNT."""
