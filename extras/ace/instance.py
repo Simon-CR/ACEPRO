@@ -558,6 +558,15 @@ class AceInstance:
                     slot_idx, "; ".join(_implausible), sku, brand, material,
                     rfid_temp, hotbed_temp)
                 self._pending_rfid_queries.discard(slot_idx)
+                # THE REJECTION IS THE TRIGGER. Firmware V1.1.3Y copies every tag image it
+                # reads into the page buffer before parsing it, so the bytes behind this
+                # misparse are still available - fetch them and decode the tag properly instead
+                # of leaving the lane untagged. Harmless on older firmware: the buffer simply
+                # will not hold a plausible image and the parse reports an unknown format.
+                try:
+                    self._fetch_raw_tag_image(slot_idx)
+                except Exception:
+                    logging.exception("ace: raw tag fetch failed for slot %s", slot_idx)
                 return
 
             if 0 <= slot_idx < self.SLOT_COUNT:
@@ -2796,48 +2805,119 @@ class AceInstance:
                 | ((arg1 & 0xFF) << 8) | (arg2 & 0xFF))
 
     def _fetch_raw_tag_image(self, slot_idx):
-        """Pull the cached raw tag image back with op 9, one byte per reply, then parse it.
+        """Recover the complete tag image, however long the tag says it is.
 
-        Only reached when the firmware reported RAW_TAG_SENTINEL, which means it read a tag
-        fine but the layout is not Anycubic's - so the positional decode it would otherwise
-        have returned is meaningless and must not be stored.
+        144 IS NOT THE SIZE OF A TAG. It is all the firmware's bulk page read reaches - pages
+        4..39, which is the whole user area of an NTAG213 and a fraction of an NTAG215/216. A
+        real OpenSpool tag on this machine declares an NDEF TLV of 0xAF = 175 bytes, and the
+        fields beyond 144 are exactly the ones that matter:
 
-        NOTHING MOVES. rawtag_stub.s copied the image into the firmware's page buffer at the
-        instant the tag was identified, so the expensive part - parking the tag on a turning
-        spool, driving the RF layer, CRC and anticollision - is already done. Reading it back
-        is pure protocol traffic.
+            ..."max_temp":"220","spool_id":26,"sm_id":26}
 
-        op 9 rather than op 4: op 4 masks its offset to 6 bits and starts at BUF+64, so it can
-        only reach bytes 64..127 - exactly the range that does NOT hold the sku, brand and
-        material pages.
+        Stopping at 144 recovers the colour, material and temperatures and misses the only field
+        that says WHICH SPOOL THIS IS. So the length comes from the tag's own TLV header rather
+        than from a constant: byte 0 is the TLV type (0x03 = NDEF) and byte 1 its length, so the
+        message runs to 2 + length + 1 for the terminator. Anything past what the page buffer
+        holds is read straight off the tag.
 
-        Chained rather than batched: each reply issues the next request, so the reactor is
-        never blocked and a device that stops answering simply stops the chain instead of
-        stalling Klipper. One byte per round trip is the protocol's shape, not a choice.
+        Nothing moves. The buffer was filled by rawtag_cache_stub.s at the moment the background
+        scan read the tag, so it is in the antenna's field right now - which is the only time the
+        extra pages can be read at all.
         """
         reader = slot_idx // 2
-        buf = bytearray(self.RAW_TAG_LEN)
-        state = {"got": 0}
+        state = {"buf": bytearray(self.RAW_TAG_LEN), "want": self.RAW_TAG_LEN}
 
-        def want(off):
+        def op(packed_idx, then):
             req = self.protocol._build_command_request(
-                "FILAMENT_IDENTIFY", {"index": self._raw_tag_packed(reader, 9, off)})
+                "FILAMENT_IDENTIFY", {"index": packed_idx})
 
             def got(response):
+                # NOTHING IN THIS CHAIN MAY RAISE. It runs inside a response callback, and an
+                # exception there does not just fail the read - it propagates into Klipper's
+                # command handling and shuts the printer down. That happened once already.
+                # A failure here just means a shorter image, which the parser handles.
                 try:
                     val = int((response or {}).get("code", 0)) & 0xFF
                 except (TypeError, ValueError):
                     val = 0
-                buf[off] = val
-                state["got"] += 1
+                try:
+                    then(val)
+                except Exception:
+                    logging.exception(
+                        "ace: raw tag chain failed on slot %s - using what was read",
+                        slot_idx)
+                    try:
+                        self._apply_raw_tag_image(slot_idx, bytes(state["buf"]))
+                    except Exception:
+                        logging.exception("ace: could not apply the partial tag image")
+
+            try:
+                self.send_request(req, got)
+            except Exception:
+                logging.exception("ace: could not send a raw tag request for slot %s", slot_idx)
+
+        def read_buffer(off):
+            """op 9 walks the cached image a byte at a time; op 4 cannot reach past byte 127."""
+            def stored(val):
+                state["buf"][off] = val
+                if off == 1:
+                    # The tag's own declaration of how much there is to read.
+                    if state["buf"][0] == 0x03:
+                        state["want"] = 2 + val + 1
                 if off + 1 < self.RAW_TAG_LEN:
-                    want(off + 1)
+                    read_buffer(off + 1)
                 else:
-                    self._apply_raw_tag_image(slot_idx, bytes(buf))
+                    if state["want"] > self.RAW_TAG_LEN:
+                        self.gcode.respond_info(
+                            "ACE[%d]: Slot %d tag declares %d bytes - reading past the "
+                            "firmware's %d-byte window for the rest"
+                            % (self.instance_num, slot_idx, state["want"],
+                               self.RAW_TAG_LEN))
+                        read_extra(40)
+                    else:
+                        self._apply_raw_tag_image(slot_idx, bytes(state["buf"]))
+            op(self._raw_tag_packed(reader, 9, off), stored)
 
-            self.send_request(req, got)
+        def read_extra(page):
+            """One NTAG READ (4 pages) at a time, straight off the tag.
 
-        want(0)
+            Re-SELECT before each: without it the tag stops answering after the first transceive
+            while the RX region still holds the previous reply - a stale read that is
+            indistinguishable from a good one.
+            """
+            if page > 100 or len(state["buf"]) >= state["want"]:
+                self._apply_raw_tag_image(slot_idx, bytes(state["buf"]))
+                return
+            seq = [self._raw_tag_packed(reader, 6, 0),
+                   self._raw_tag_packed(reader, 2, 0, 0x30),
+                   self._raw_tag_packed(reader, 2, 1, page),
+                   self._raw_tag_packed(reader, 3, 2, 0x0C)]
+            rx = []
+
+            def step(i):
+                def done(_val):
+                    step(i + 1)
+                if i < len(seq):
+                    op(seq[i], done)
+                else:
+                    grab(0)
+
+            def grab(j):
+                def stored(val):
+                    rx.append(val)
+                    if j + 1 < 16:
+                        grab(j + 1)
+                    elif not any(rx):
+                        # The tag stopped answering: that is the end of its memory.
+                        self._apply_raw_tag_image(slot_idx, bytes(state["buf"]))
+                    else:
+                        state["buf"].extend(rx)
+                        read_extra(page + 4)
+                op(self._raw_tag_packed(reader, 9, 64 + j), stored)
+
+            step(0)
+
+        read_buffer(0)
 
     def _apply_raw_tag_image(self, slot_idx, image):
         """Turn the raw image into inventory fields, whatever wrote the tag."""
@@ -2883,6 +2963,59 @@ class AceInstance:
                 self.manager._sync_inventory_to_persistent()
             except Exception:
                 logging.exception("ace: could not persist raw tag inventory")
+
+    def _live_read_then_cache(self, slot_idx):
+        """Try a LIVE tag read first, and only fall back to the cached record.
+
+        GET_FILAMENT_INFO (cmd 13) is served by the firmware's cache handler at 0x0800E910 and
+        never touches the tag. FILAMENT_IDENTIFY (cmd 68, 0x0800E7A8) is the command that
+        actually selects the card and reads its pages - and it is the one V1.1.3X's raw-tag hook
+        sits on, so it is the only route by which a non-Anycubic tag can be decoded at all.
+
+        The catch is that a tag is only in the antenna's field while the spool turns, so a cmd 68
+        issued at an arbitrary moment answers code 3 (SELECT failed). THIS is the right moment:
+        the caller has just seen the RFID-detected edge, which means the preload search stopped
+        BECAUSE the tag reached the coil. Anywhere else the read fails; here it should succeed.
+
+        The cache is worth falling back to rather than abandoning: it survives a failed read, and
+        for an Anycubic tag it holds a perfectly good decode. It also outlives the spool - the
+        firmware does not clear it on eject - which is why a stale record must never be preferred
+        to a live read.
+
+        Defensive throughout. This runs inside a status callback, and an exception here took
+        Klipper down once already; nothing in this path may raise.
+        """
+        try:
+            if slot_idx in self._pending_rfid_queries:
+                return
+            self._pending_rfid_queries.add(slot_idx)
+
+            def after_live(response):
+                try:
+                    code = int((response or {}).get("code", -1))
+                except (TypeError, ValueError):
+                    code = -1
+                self._pending_rfid_queries.discard(slot_idx)
+                if code == 0:
+                    self._handle_rfid_info_response(slot_idx, response)
+                    return
+                # 3 = SELECT failed (tag not in the field), 4 = anticollision,
+                # 6 = read refused (a MIFARE/Bambu tag). None of these are faults here.
+                self.gcode.respond_info(
+                    "ACE[%d]: Slot %d live tag read returned code %s - using the cached record"
+                    % (self.instance_num, slot_idx, code))
+                self._query_rfid_full_data(slot_idx)
+
+            req = self.protocol._build_command_request(
+                "FILAMENT_IDENTIFY", {"index": slot_idx})
+            self.send_request(req, after_live)
+        except Exception:
+            logging.exception("ace: live tag read failed for slot %s", slot_idx)
+            self._pending_rfid_queries.discard(slot_idx)
+            try:
+                self._query_rfid_full_data(slot_idx)
+            except Exception:
+                logging.exception("ace: cached fallback also failed for slot %s", slot_idx)
 
     def _query_rfid_full_data(self, slot_idx):
         """
@@ -3135,10 +3268,10 @@ class AceInstance:
                             if not saved_rfid and not query_pending:
                                 updated_rfid = True
                                 # Query get_filament_info - callback will populate all metadata
-                                self._query_rfid_full_data(idx)
+                                self._live_read_then_cache(idx)
                                 self.gcode.respond_info(
                                     f"ACE[{self.instance_num}]: Slot {idx} RFID detected -> "
-                                    f"querying get_filament_info..."
+                                    f"reading the tag (it is in the coil right now)..."
                                 )
                                 inventory_changed = True
                             else:
