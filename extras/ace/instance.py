@@ -28,6 +28,127 @@ from .protocol import create_protocol_adapter, normalize_protocol_name, resolve_
 from .serial_manager import AceSerialManager
 
 
+# === BEGIN PURE TAG POLICY HELPERS (Worker 3) ===
+# Every heat/bind decision the capture path makes is expressed here as a pure function, with no
+# Klipper dependency, so the safety-critical logic can be unit-tested outside Klipper (instance.py
+# itself cannot be imported without the hardware stack). The methods below CALL these; they never
+# re-implement the decision inline.
+
+NATIVE_TAG_VERSION = 101       # 0x65: Anycubic positional decode - the ONLY trusted layout (R1)
+BAMBU_UID_SENTINEL = 0x0201    # 513: firmware handed the tag UID back as hex in result["sku"]
+RAW_TAG_SENTINEL_V = 0x0202    # 514: non-Anycubic tag, raw image cached (== AceInstance.RAW_TAG_SENTINEL)
+
+# Formats whose parsed fields describe a real filament and MAY seed a heat target. Deliberately
+# excludes unknown/ndef/ndef-json/blank/bambu: a generic or unproven decode renders, never heats.
+_REAL_TAG_FORMATS = frozenset((
+    "anycubic", "openspool", "filaman", "openprinttag", "json"))
+
+
+def _normalise_uid_local(uid):
+    """Strip separators and upper-case a UID for comparison, without importing anything.
+
+    Mirrors ace_tag_formats.normalise_uid so the anticollision check still works if that module is
+    momentarily unavailable; the wire handoff re-normalises in Moonraker regardless.
+    """
+    if not uid:
+        return ""
+    return "".join(c.upper() for c in str(uid) if c in "0123456789abcdefABCDEF")
+
+
+def classify_tag_version(version):
+    """Map a GET_FILAMENT_INFO `version` to the capture action. The R1 heater whitelist.
+
+    Returns "native" | "bambu" | "raw" | "foreign". Positional temp/material fields may be
+    trusted ONLY for "native"; every other result routes to UID resolution or a raw-image fetch.
+    """
+    try:
+        v = int(version or 0)
+    except (TypeError, ValueError):
+        return "foreign"
+    if v == NATIVE_TAG_VERSION:
+        return "native"
+    if v == BAMBU_UID_SENTINEL:
+        return "bambu"
+    if v == RAW_TAG_SENTINEL_V:
+        return "raw"
+    return "foreign"
+
+
+def raw_temp_to_store(fmt, temp_min, temp_max):
+    """The nozzle temp to store from a RAW-fetched tag image, or None. The R1/R3 heat gate.
+
+    Allowed only when the tag is a RECOGNISED real format AND the value is physically plausible
+    (0 < t < 500) AND, when both bounds are present, temp_min <= temp_max. Anything else -> None:
+    render colour/material, but never heat off an unproven decode.
+    """
+    if fmt not in _REAL_TAG_FORMATS:
+        return None
+
+    def _int(x):
+        try:
+            return int(x)
+        except (TypeError, ValueError):
+            return None
+    lo, hi = _int(temp_min), _int(temp_max)
+    if lo is not None and hi is not None and lo > hi:
+        return None                      # inverted range: a positional-misparse tell
+    t = hi if hi is not None else lo     # prefer the max, matching the historical raw path
+    if t is None or not (0 < t < 500):
+        return None
+    return t
+
+
+def anticollision_ok(uid_self, uid_neighbour):
+    """Whether slot S may bind, given its paired-antenna neighbour's UID. The R2 guard.
+
+    reader = slot // 2, so slots 0+1 and 2+3 share one antenna. If the neighbour presents the SAME
+    normalised UID, the shared coil read one tag twice and the capture cannot be attributed to S
+    -> refuse. An empty UID on either side is no evidence of a collision -> allow.
+    """
+    a = _normalise_uid_local(uid_self)
+    b = _normalise_uid_local(uid_neighbour)
+    return not (a and b and a == b)
+
+
+def reply_index_matches(reply_index, slot_idx):
+    """Whether a GET_FILAMENT_INFO reply may be attributed to the slot asked. The R2 attribution.
+
+    Only an UNAMBIGUOUS mismatch rejects. The protocol decodes an ABSENT index field as 0
+    (protocol_ace2.py `_pb_first(fields, 1, 0)`), so 0 is ambiguous - a real slot 0 or no index at
+    all - and must never be treated as proof of misattribution, or a firmware that omits the field
+    would falsely reject every non-zero lane. A reply with no index (None) or index 0 is trusted
+    to the closure; only a POSITIVE index that differs from slot_idx is proof of another lane.
+    """
+    if reply_index is None:
+        return True
+    try:
+        ri = int(reply_index)
+    except (TypeError, ValueError):
+        return True
+    if ri <= 0:
+        return True
+    return ri == int(slot_idx)
+
+
+def build_wire_record(rec, uid, native):
+    """Assemble the Klipper->Moonraker wire payload from a parsed record. The R7 helper.
+
+    Copies only public JSON-serialisable fields (drops `_raw_json`, `_truncated`, `why` and any
+    other private key), forces `format` to a string, and stamps uid/native so the resolver sees
+    exactly the contract's PARSED RECORD shape.
+    """
+    wire = {}
+    for k, v in dict(rec or {}).items():
+        if not isinstance(k, str) or k.startswith("_") or k == "why":
+            continue
+        wire[k] = v
+    wire["format"] = str((rec or {}).get("format") or "unknown")
+    wire["uid"] = uid or None
+    wire["native"] = bool(native)
+    return wire
+# === END PURE TAG POLICY HELPERS (Worker 3) ===
+
+
 def _extruder_accel(printer, default=1500.):
     """Acceleration for FORCE_MOVE, from the printer's own extruder limit.
 
@@ -226,6 +347,9 @@ class AceInstance:
         self._dryer_temperature = 0
         self._dryer_duration = 0
         self._pending_rfid_queries = set()  # Track slots with in-flight RFID queries
+        # Last normalised UID observed per slot, for the R2 paired-antenna anticollision check
+        # (slots 0+1 and 2+3 share one reader). Refreshed on every UID-bearing decode.
+        self._slot_uid = {}
         self.status_failure_threshold = max(
             1,
             int(ace_config.get("status_failure_threshold", 4)),
@@ -490,46 +614,64 @@ class AceInstance:
                 rfid_temp = self.DEFAULT_TEMP
                 have_temp_data = False
 
-            # V1.1.3X RAW-TAG SENTINEL, CHECKED BEFORE ANY FIELD IS TRUSTED.
-            #
-            # The firmware decodes exactly one layout and reads every field at a fixed offset
-            # after the page-4 magic. When it meets a tag it cannot decode it now says so
-            # explicitly instead of handing back a positional misparse, and caches the raw
-            # image for us. Every field in THIS response was produced by that same misparse and
-            # is meaningless, so nothing here may be stored - the real values arrive when the
-            # fetched image is parsed.
-            if int(result.get("version", 0) or 0) == self.RAW_TAG_SENTINEL:
+            # R2 ATTRIBUTION. The reply carries its own slot index (protocol field 1). Older
+            # firmware may omit it; only a POSITIVE mismatch is proof this decode belongs to a
+            # different lane, and it must never be written here on the closure's word alone.
+            reply_index = result.get("index")
+            if not reply_index_matches(reply_index, slot_idx):
+                self.gcode.respond_info(
+                    "ACE[%d]: Slot %d RFID reply was for slot %s - ignoring (attribution/"
+                    "anticollision)" % (self.instance_num, slot_idx, reply_index))
+                logging.warning("ace: slot %s rfid reply index mismatch (reply=%r) - ignored",
+                                slot_idx, reply_index)
+                self._pending_rfid_queries.discard(slot_idx)
+                return
+
+            # R1 HEATER WHITELIST. The firmware parses tag bytes POSITIONALLY against Anycubic's
+            # layout and returns code 0 for ANY tag, so a foreign tag comes back as structured
+            # garbage that merely LOOKS valid (2026-09-01: an OpenSpool tag decoded to
+            # sku='application/json{"', temp=28770C, hotbed min 8804 > max 8762, and fed 28770 to
+            # the heater). ONLY version 101 is a real Anycubic decode whose temp/material may be
+            # trusted. Every other value routes away from the positional fields BEFORE any of them
+            # can reach inv["temp"]; this replaces "trust anything that limps past the gate".
+            version = int(result.get("version", 0) or 0)
+            action = classify_tag_version(version)
+
+            if action == "raw":
+                # 0x0202: firmware cached a non-Anycubic image. Fetch and decode it by format.
                 self.gcode.respond_info(
                     "ACE[%d]: Slot %d carries a non-Anycubic tag - fetching its raw image"
                     % (self.instance_num, slot_idx))
                 self._fetch_raw_tag_image(slot_idx)
                 return
 
-            # PLAUSIBILITY GATE. A decode that cannot be real must not be stored as if it were.
-            #
-            # The ACE parses tag bytes POSITIONALLY against Anycubic's own layout. A foreign tag
-            # in a different encoding still returns code 0, so every check upstream passes and
-            # the fields come back as garbage that merely LOOKS structured.
-            #
-            # 2026-09-01, an OpenSpool (NDEF/JSON) tag in lane 1:
-            #     sku=application/json{"   temp=28770C (min=26719, max=30821)
-            #     hotbed={'min': 8804, 'max': 8762}   color=RGB(58,34,101)
-            # `application/json` is the NDEF MIME record header being read as a SKU. That did
-            # three kinds of damage, none of which a "failed to read" would have done:
-            #   * temp fed _ACE_PRE_TOOLCHANGE, which sets the heat target from the lane's RFID
-            #     temp - 28770 as a heater target.
-            #   * the text carries DOUBLE QUOTES, and it lands inside RESPOND MSG="...", which
-            #     terminated the string early:  Malformed command 'RESPOND MSG="  T1  READY
-            #     ,"version":"1.0","t  (no spool assigned)"'
-            #   * the panel showed a spool that does not exist.
-            #
-            # Two independent tells here, and either alone is proof:
-            #   hotbed min > max   - no real tag describes an inverted range
-            #   temp far outside any hotend's working range
-            # Reject the whole decode rather than sanitising fields: a positional misparse means
-            # EVERY field came from the wrong offsets, so a field that happens to look sane is
-            # still meaningless. Treat it as no tag, which is the honest state and the one the
-            # preload search handles safely.
+            if action == "bambu":
+                # 0x0201: result["sku"] IS the tag UID as hex; no usable material/temp. Route to
+                # scenario-2 (UID) resolution and never seed the heater.
+                self._consume_bambu_uid_tag(slot_idx, result)
+                return
+
+            if action != "native":
+                # Any other version is a foreign POSITIONAL MISPARSE: every field is from the
+                # wrong offsets. Trust NO field, set NO temp, and fetch the raw image so the tag
+                # can be decoded by format (scenario 3 render / offline) instead.
+                self.gcode.respond_info(
+                    "ACE[%d]: Slot %d RFID version %s is not an Anycubic decode - trusting no "
+                    "positional field, fetching its raw image"
+                    % (self.instance_num, slot_idx, version))
+                logging.warning("ace: slot %s foreign rfid version %r - positional fields "
+                                "rejected, fetching raw image", slot_idx, version)
+                self._pending_rfid_queries.discard(slot_idx)
+                try:
+                    self._fetch_raw_tag_image(slot_idx)
+                except Exception:
+                    logging.exception("ace: raw tag fetch failed for slot %s", slot_idx)
+                return
+
+            # version == 101 NATIVE decode: positional fields are trustworthy. The PLAUSIBILITY
+            # GATE stays as a SECONDARY backstop - even a native decode can corrupt, and an
+            # inverted hotbed range or an out-of-range nozzle temp still diverts to the raw-image
+            # fetch rather than a bad heat target.
             _implausible = []
             try:
                 _hb = hotbed_temp or {}
@@ -547,22 +689,15 @@ class AceInstance:
 
             if _implausible:
                 self.gcode.respond_info(
-                    "ACE[%s]: Slot %s RFID decode REJECTED (%s) - the tag is readable but is "
-                    "not in Anycubic's format, so these bytes were parsed at the wrong offsets. "
-                    "Treating the lane as untagged. Assign it with MMU_GATE_MAP GATE=%s "
-                    "SPOOLID=<n>, or write an Anycubic-format tag."
-                    % (self.instance_num, slot_idx, "; ".join(_implausible), slot_idx))
+                    "ACE[%s]: Slot %s RFID decode REJECTED (%s) - a version-101 decode that "
+                    "cannot be real. Treating the lane as untagged and fetching the raw image."
+                    % (self.instance_num, slot_idx, "; ".join(_implausible)))
                 logging.warning(
-                    "ace: slot %s implausible RFID decode rejected (%s) raw sku=%r brand=%r "
-                    "material=%r temp=%r hotbed=%r",
+                    "ace: slot %s implausible native RFID decode rejected (%s) raw sku=%r "
+                    "brand=%r material=%r temp=%r hotbed=%r",
                     slot_idx, "; ".join(_implausible), sku, brand, material,
                     rfid_temp, hotbed_temp)
                 self._pending_rfid_queries.discard(slot_idx)
-                # THE REJECTION IS THE TRIGGER. Firmware V1.1.3Y copies every tag image it
-                # reads into the page buffer before parsing it, so the bytes behind this
-                # misparse are still available - fetch them and decode the tag properly instead
-                # of leaving the lane untagged. Harmless on older firmware: the buffer simply
-                # will not hold a plausible image and the parse reports an unknown format.
                 try:
                     self._fetch_raw_tag_image(slot_idx)
                 except Exception:
@@ -615,11 +750,114 @@ class AceInstance:
 
                 if self.manager:
                     self.manager._sync_inventory_to_persistent(self.instance_num, flush=False)
+
+                # R1/R7 HANDOFF (scenario 1). A native decode's SKU is the spool number; hand the
+                # record to the Moonraker resolver so it can bind a CONFIRMED spool. The local
+                # temp/material set above stay (native is the one trusted layout); the resolver,
+                # not this path, owns the spool-id binding decision (R8). native uses no UID (the
+                # firmware read starts at page 4, past the UID pages), so no anticollision applies.
+                native_record = {
+                    "sku": sku or None,
+                    "brand": brand or None,
+                    "material": material or None,
+                    "color": ("%02X%02X%02X" % (rfid_color[0], rfid_color[1], rfid_color[2]))
+                    if rfid_color else None,
+                    "temp_min": (temp_min or None),
+                    "temp_max": (temp_max or None),
+                    "bed_min": (hotbed_temp.get("min") or None) if hotbed_temp else None,
+                    "bed_max": (hotbed_temp.get("max") or None) if hotbed_temp else None,
+                    "diameter": (diameter or None),
+                    "total_g": (total or None),
+                    "format": "anycubic",
+                }
+                self._handoff_to_moonraker(slot_idx, native_record, uid="", native=True)
         else:
             msg = response.get("msg", "Unknown") if response else "No response"
             self.gcode.respond_info(
                 f"ACE[{self.instance_num}]: get_filament_info failed for slot {slot_idx}: {msg}"
             )
+
+    def _consume_bambu_uid_tag(self, slot_idx, result):
+        """Scenario 2: a Bambu tag whose UID the firmware handed back as hex in result['sku'].
+
+        No material or temperature is trusted - a Bambu tag carries none the firmware can read.
+        The UID is normalised, checked against the paired-antenna neighbour (R2), recorded for the
+        neighbour's own future check, and handed to the Moonraker resolver for UID-based binding.
+        Never seeds the heater. Never raises into Klipper.
+        """
+        try:
+            self._pending_rfid_queries.discard(slot_idx)
+            raw_uid = result.get("sku") or ""
+            try:
+                from . import ace_tag_formats as fmts
+                uid = fmts.normalise_uid(raw_uid)
+            except Exception:
+                uid = _normalise_uid_local(raw_uid)
+            if not uid:
+                self.gcode.respond_info(
+                    "ACE[%d]: Slot %d Bambu tag carried no readable UID - lane left untagged"
+                    % (self.instance_num, slot_idx))
+                return
+            if not self._anticollision_clear(slot_idx, uid):
+                return
+            record = {
+                "sku": None, "brand": None, "material": None, "color": None,
+                "temp_min": None, "temp_max": None, "bed_min": None, "bed_max": None,
+                "diameter": None, "total_g": None, "format": "bambu",
+            }
+            self.gcode.respond_info(
+                "ACE[%d]: Slot %d Bambu/UID tag %s - resolving by UID (no temp/material trusted)"
+                % (self.instance_num, slot_idx, uid))
+            self._handoff_to_moonraker(slot_idx, record, uid=uid, native=False)
+        except Exception:
+            logging.exception("ace: bambu uid consumption failed for slot %s", slot_idx)
+            self._pending_rfid_queries.discard(slot_idx)
+
+    def _anticollision_clear(self, slot_idx, uid):
+        """R2 paired-antenna guard. slots 0+1 and 2+3 share one reader (slot // 2). If the paired
+        neighbour last presented the SAME normalised UID, this capture cannot be attributed to
+        slot_idx (the shared coil read one tag twice) - refuse and say so. Records slot_idx's UID
+        for the neighbour's check. Returns True when binding may proceed. Fails CLOSED.
+        """
+        try:
+            neighbour = slot_idx ^ 1
+            neigh_uid = self._slot_uid.get(neighbour, "")
+            self._slot_uid[slot_idx] = uid
+            if not anticollision_ok(uid, neigh_uid):
+                reader = slot_idx // 2
+                self.gcode.respond_info(
+                    "ACE[%d]: Slot %d and its paired neighbour %d (reader %d) both read UID %s - "
+                    "the shared antenna cannot say which lane holds the tag. Refusing to bind; "
+                    "assign it explicitly with MMU_GATE_MAP GATE=%d SPOOLID=<n>."
+                    % (self.instance_num, slot_idx, neighbour, reader, uid, slot_idx))
+                logging.warning("ace: slot %s anticollision refusal - neighbour %s shares UID %s",
+                                slot_idx, neighbour, uid)
+                return False
+            return True
+        except Exception:
+            logging.exception("ace: anticollision check failed for slot %s", slot_idx)
+            return False
+
+    def _handoff_to_moonraker(self, slot_idx, record, uid, native):
+        """Fire-and-forget the parsed tag to Moonraker's `ace_resolve_tag` for identity
+        resolution and binding (R7/R8). Moonraker owns the spool-id decision; this only reports.
+
+        Mirrors the call_remote_method convention already used for `filaman_report_usage`. MUST
+        NEVER raise into Klipper: a bare exception in a driver callback shuts the printer down
+        (it has here before), so every failure is swallowed and logged, degrading to offline/none.
+        """
+        try:
+            wire = build_wire_record(record, uid, native)
+            self.printer.lookup_object("webhooks").call_remote_method(
+                "ace_resolve_tag",
+                instance=self.instance_num, slot=slot_idx, record=wire,
+                uid=(uid or ""), native=bool(native))
+            logging.info("ace: slot %s handed off to Moonraker resolver (native=%s uid=%r "
+                         "sku=%r fmt=%s)", slot_idx, bool(native), uid or "",
+                         wire.get("sku"), wire.get("format"))
+        except Exception:
+            logging.exception("ace: tag handoff to Moonraker failed for slot %s (identity falls "
+                              "back to offline/none)", slot_idx)
 
     def handle_shared_bus_filament_info_response(self, response):
         """Replay a late shared-bus get_filament_info reply if the slot is still pending."""
@@ -2805,122 +3043,85 @@ class AceInstance:
                 | ((arg1 & 0xFF) << 8) | (arg2 & 0xFF))
 
     def _fetch_raw_tag_image(self, slot_idx):
-        """Recover the complete tag image, however long the tag says it is.
+        """Copy the captured image out of the page buffer. Nothing else. Nothing that writes.
 
-        144 IS NOT THE SIZE OF A TAG. It is all the firmware's bulk page read reaches - pages
-        4..39, which is the whole user area of an NTAG213 and a fraction of an NTAG215/216. A
-        real OpenSpool tag on this machine declares an NDEF TLV of 0xAF = 175 bytes, and the
-        fields beyond 144 are exactly the ones that matter:
+        THE CAPTURE WAS NEVER THE PROBLEM. A paced byte-by-byte audit of the buffer found the
+        pristine image still sitting there - and every damaged region mapped to a write made by
+        an earlier version of THIS function: bytes 0-1 were its staged READ opcode, 2-21 its
+        SELECT scratch, 64-127 its transceive replies. The fetch was vandalising the evidence it
+        came to collect, attempt after attempt, and each attempt poisoned the buffer the next
+        one read.
 
-            ..."max_temp":"220","spool_id":26,"sm_id":26}
+        So this version performs no RF operation at all. op 9 is a pure memory read; SELECT,
+        staging and transceive are gone, and with them every way this path can corrupt the
+        buffer, interfere with a load, or depend on where the tag happens to be.
 
-        Stopping at 144 recovers the colour, material and temperatures and misses the only field
-        that says WHICH SPOOL THIS IS. So the length comes from the tag's own TLV header rather
-        than from a constant: byte 0 is the TLV type (0x03 = NDEF) and byte 1 its length, so the
-        message runs to 2 + length + 1 for the terminator. Anything past what the page buffer
-        holds is read straight off the tag.
-
-        Nothing moves. The buffer was filled by rawtag_cache_stub.s at the moment the background
-        scan read the tag, so it is in the antenna's field right now - which is the only time the
-        extra pages can be read at all.
+        THE TAIL IS NOT READ, BECAUSE IT CANNOT BE. The firmware captures pages 4..39 = 144
+        bytes while the tag sweeps past the coil mid-preload; by the time the host learns a
+        decode was rejected, the spool has carried the tag far out of the field - measured: a
+        SELECT at fetch time returns nothing at all. A 177-byte OpenSpool message therefore has
+        its last ~33 bytes - the closing brace and the spool identity - physically beyond
+        reach on the automatic path. The parser repairs the truncated JSON and yields every
+        field the head holds (brand, material, colour, temps); identity comes honestly or not
+        at all. Closing that gap needs the FIRMWARE to read more pages at capture time, or tags
+        whose payload fits in 144 bytes. It cannot be fixed from here, and pretending otherwise
+        cost this machine a full evening.
         """
+        # R5 TORN BUFFER. The op-9 walk below takes ~2.88s (144 reads x 0.02s). Hold the slot in
+        # _pending_rfid_queries for the WHOLE walk so no host-initiated read (live/cached/refresh)
+        # can start mid-walk and splice the buffer; it is released in _apply_raw_tag_image on
+        # success and on every failure path here. (image_is_intact in _apply is the backstop
+        # against a firmware-side scan, which pending cannot block.)
+        self._pending_rfid_queries.add(slot_idx)
         reader = slot_idx // 2
-        state = {"buf": bytearray(self.RAW_TAG_LEN), "want": self.RAW_TAG_LEN}
+        buf = bytearray(self.RAW_TAG_LEN)
 
-        def op(packed_idx, then):
-            req = self.protocol._build_command_request(
-                "FILAMENT_IDENTIFY", {"index": packed_idx})
-
+        def read(off):
             def got(response):
-                # NOTHING IN THIS CHAIN MAY RAISE. It runs inside a response callback, and an
-                # exception there does not just fail the read - it propagates into Klipper's
-                # command handling and shuts the printer down. That happened once already.
-                # A failure here just means a shorter image, which the parser handles.
                 try:
-                    val = int((response or {}).get("code", 0)) & 0xFF
+                    buf[off] = int((response or {}).get("code", 0)) & 0xFF
                 except (TypeError, ValueError):
-                    val = 0
+                    buf[off] = 0
                 try:
-                    then(val)
-                except Exception:
-                    logging.exception(
-                        "ace: raw tag chain failed on slot %s - using what was read",
-                        slot_idx)
-                    try:
-                        self._apply_raw_tag_image(slot_idx, bytes(state["buf"]))
-                    except Exception:
-                        logging.exception("ace: could not apply the partial tag image")
-
-            try:
-                self.send_request(req, got)
-            except Exception:
-                logging.exception("ace: could not send a raw tag request for slot %s", slot_idx)
-
-        def read_buffer(off):
-            """op 9 walks the cached image a byte at a time; op 4 cannot reach past byte 127."""
-            def stored(val):
-                state["buf"][off] = val
-                if off == 1:
-                    # The tag's own declaration of how much there is to read.
-                    if state["buf"][0] == 0x03:
-                        state["want"] = 2 + val + 1
-                if off + 1 < self.RAW_TAG_LEN:
-                    read_buffer(off + 1)
-                else:
-                    if state["want"] > self.RAW_TAG_LEN:
+                    if off + 1 < self.RAW_TAG_LEN:
+                        # A breath between reads. Deferred on the reactor, never slept - this
+                        # runs inside a response callback, where blocking stalls all of Klipper
+                        # and an exception shuts the printer down (both happened tonight).
+                        self.reactor.register_callback(
+                            lambda et: read(off + 1), self.reactor.monotonic() + 0.02)
+                    else:
+                        img = bytes(buf)
                         self.gcode.respond_info(
-                            "ACE[%d]: Slot %d tag declares %d bytes - reading past the "
-                            "firmware's %d-byte window for the rest"
-                            % (self.instance_num, slot_idx, state["want"],
-                               self.RAW_TAG_LEN))
-                        read_extra(40)
-                    else:
-                        self._apply_raw_tag_image(slot_idx, bytes(state["buf"]))
-            op(self._raw_tag_packed(reader, 9, off), stored)
+                            "ACE[%d]: Slot %d captured image | head %s | %s"
+                            % (self.instance_num, slot_idx,
+                               "".join("%02x" % b for b in img[:16]),
+                               "".join(chr(c) if 32 <= c < 127 else "."
+                                       for c in img[:64])))
+                        self._apply_raw_tag_image(slot_idx, img)
+                except Exception:
+                    logging.exception("ace: tag fetch chain failed for slot %s", slot_idx)
+                    self._pending_rfid_queries.discard(slot_idx)   # R5: never leak the hold
+            try:
+                self.send_request(self.protocol._build_command_request(
+                    "FILAMENT_IDENTIFY",
+                    {"index": self._raw_tag_packed(reader, 9, off)}), got)
+            except Exception:
+                logging.exception("ace: could not send a tag fetch read for slot %s", slot_idx)
+                self._pending_rfid_queries.discard(slot_idx)       # R5: never leak the hold
 
-        def read_extra(page):
-            """One NTAG READ (4 pages) at a time, straight off the tag.
-
-            Re-SELECT before each: without it the tag stops answering after the first transceive
-            while the RX region still holds the previous reply - a stale read that is
-            indistinguishable from a good one.
-            """
-            if page > 100 or len(state["buf"]) >= state["want"]:
-                self._apply_raw_tag_image(slot_idx, bytes(state["buf"]))
-                return
-            seq = [self._raw_tag_packed(reader, 6, 0),
-                   self._raw_tag_packed(reader, 2, 0, 0x30),
-                   self._raw_tag_packed(reader, 2, 1, page),
-                   self._raw_tag_packed(reader, 3, 2, 0x0C)]
-            rx = []
-
-            def step(i):
-                def done(_val):
-                    step(i + 1)
-                if i < len(seq):
-                    op(seq[i], done)
-                else:
-                    grab(0)
-
-            def grab(j):
-                def stored(val):
-                    rx.append(val)
-                    if j + 1 < 16:
-                        grab(j + 1)
-                    elif not any(rx):
-                        # The tag stopped answering: that is the end of its memory.
-                        self._apply_raw_tag_image(slot_idx, bytes(state["buf"]))
-                    else:
-                        state["buf"].extend(rx)
-                        read_extra(page + 4)
-                op(self._raw_tag_packed(reader, 9, 64 + j), stored)
-
-            step(0)
-
-        read_buffer(0)
+        read(0)
 
     def _apply_raw_tag_image(self, slot_idx, image):
-        """Turn the raw image into inventory fields, whatever wrote the tag."""
+        """Turn a raw-fetched tag image into inventory render fields and hand identity off.
+
+        R8: this NO LONGER binds a spool locally (no spool_from_record) - the Moonraker resolver is
+        the single identity authority. It still stores material/colour/brand for OFFLINE display,
+        gates the heater per R1/R3 (temp only from a recognised real format with a plausible
+        value), refuses a torn buffer per R5, and refuses a paired-antenna collision per R2.
+        Never raises into Klipper.
+        """
+        # The op-9 walk is finished; release the R5 hold so a fresh read may run later.
+        self._pending_rfid_queries.discard(slot_idx)
         try:
             from . import ace_tag_formats as fmts
         except ImportError:
@@ -2935,18 +3136,46 @@ class AceInstance:
             logging.exception("ace: could not parse raw tag image for slot %s", slot_idx)
             return
 
-        spool = fmts.spool_from_record(rec)
+        fmt = rec.get("format")
+
+        # R5 TORN BUFFER. The op-9 walk takes ~2.88s and a firmware-side scan can splice it. Ask
+        # the pure module whether the image is structurally intact; on a torn buffer degrade to
+        # scenario 3 (render what parsed, never bind) rather than trust spliced identity bytes.
+        intact = True
+        checker = getattr(fmts, "image_is_intact", None) or getattr(fmts, "ndef_is_intact", None)
+        if callable(checker):
+            try:
+                intact = bool(checker(image))
+            except Exception:
+                logging.exception("ace: image_is_intact check failed for slot %s", slot_idx)
+                intact = True   # a broken checker must not block a legitimate render
+
+        # R3: recover the tag UID from the image (4- or 7-byte layout) for scenario-2 resolution.
+        try:
+            # N1 (QA): the raw image is pages 4..39, NOT page 0, so the UID is not in it.
+            # first_page=4 makes uid_from_image return "" instead of misreading page-4
+            # bytes as a page-0 UID (~1/128 would emit a bogus one). The 7-byte NTAG UID
+            # only becomes available with the deferred firmware stash.
+            uid = _normalise_uid_local(fmts.uid_from_image(image, first_page=4) or "")
+        except Exception:
+            logging.exception("ace: uid_from_image failed for slot %s", slot_idx)
+            uid = ""
+
+        # R1/R3 HEATER GATE. Only a recognised real format with a plausible value may seed temp.
+        temp_to_store = raw_temp_to_store(fmt, rec.get("temp_min"), rec.get("temp_max"))
+
         self.gcode.respond_info(
-            "ACE[%d]: Slot %d tag is %s format (%s) - sku=%r material=%r colour=%r%s"
-            % (self.instance_num, slot_idx, rec.get("format"), rec.get("why"),
-               rec.get("sku"), rec.get("material"), rec.get("color"),
-               (" -> spool %d" % spool) if spool is not None else " (no spool id on the tag)"))
+            "ACE[%d]: Slot %d tag is %s format (%s) - sku=%r material=%r colour=%r uid=%r%s%s"
+            % (self.instance_num, slot_idx, fmt, rec.get("why"),
+               rec.get("sku"), rec.get("material"), rec.get("color"), uid,
+               "" if intact else " [TORN IMAGE - render only]",
+               (" temp=%d" % temp_to_store) if temp_to_store is not None else " (no heat)"))
 
         if 0 <= slot_idx < self.SLOT_COUNT:
             inv = self.inventory[slot_idx]
-            # A partial record is still worth storing: it renders the lane with the backend
-            # unreachable, which is the point of reading the tag rather than only trusting
-            # FilaMan. Never overwrite a good value with None.
+            # A partial record still renders the lane with the backend unreachable, which is the
+            # point of reading the tag. Never overwrite a good value with None. Identity binding is
+            # NOT decided here (R8) - only render fields, and temp only when the gate above allowed.
             if rec.get("material"):
                 inv["material"] = rec["material"]
             if rec.get("brand"):
@@ -2955,14 +3184,31 @@ class AceInstance:
                 inv["color"] = rec["color"]
             if rec.get("sku"):
                 inv["sku"] = str(rec["sku"])
-            if rec.get("temp_max"):
-                inv["temp"] = int(rec["temp_max"])
-            inv["tag_format"] = rec.get("format")
-            self._pending_rfid_queries.discard(slot_idx)
+            if temp_to_store is not None:
+                inv["temp"] = int(temp_to_store)
+            inv["tag_format"] = fmt
             try:
                 self.manager._sync_inventory_to_persistent()
             except Exception:
                 logging.exception("ace: could not persist raw tag inventory")
+
+        if not intact:
+            self.gcode.respond_info(
+                "ACE[%d]: Slot %d raw image was torn (a background scan spliced the ~2.88s read) "
+                "- rendered from the tag but NOT binding identity. Re-present the spool to retry, "
+                "or assign with MMU_GATE_MAP GATE=%d SPOOLID=<n>."
+                % (self.instance_num, slot_idx, slot_idx))
+            return
+
+        # R2 paired-antenna guard, only meaningful when a UID was actually recovered.
+        if uid and not self._anticollision_clear(slot_idx, uid):
+            return
+
+        # R7/R8 HANDOFF. The resolver decides the spool id against the CONFIRMED backend (sku
+        # scenario 1, uid scenario 2, or scenario-3 render) - not this path.
+        rec_uid = dict(rec)
+        rec_uid["uid"] = uid
+        self._handoff_to_moonraker(slot_idx, rec_uid, uid=uid, native=False)
 
     def _live_read_then_cache(self, slot_idx):
         """Try a LIVE tag read first, and only fall back to the cached record.
