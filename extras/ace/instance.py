@@ -3138,6 +3138,22 @@ class AceInstance:
 
         fmt = rec.get("format")
 
+        # BUFFER-CONTAMINATION GUARD. The raw fetch path is reached ONLY for a NON-Anycubic
+        # tag (an Anycubic tag decodes natively in firmware and never triggers a fetch). An
+        # Anycubic-format image here therefore cannot be THIS lane's own tag - it is a
+        # neighbour's Anycubic tag left in the shared page buffer 0x20000704 and read back
+        # by op-9. Observed: slot 3, on the OTHER physical reader, returned slot 0's SM22 -
+        # impossible over RF, so it is the buffer. Reject; never bind a neighbour's identity.
+        if fmt == "anycubic":
+            self.gcode.respond_info(
+                "ACE[%d]: Slot %d raw fetch returned an Anycubic image (%r) - only a "
+                "NON-Anycubic tag reaches this path, so this is a neighbour's tag in the "
+                "shared buffer, not this lane's. Ignoring."
+                % (self.instance_num, slot_idx, rec.get("sku")))
+            logging.warning("ace: slot %s raw fetch buffer-contaminated (anycubic sku %r) "
+                            "- dropped", slot_idx, rec.get("sku"))
+            return
+
         # R5 TORN BUFFER. The op-9 walk takes ~2.88s and a firmware-side scan can splice it. Ask
         # the pure module whether the image is structurally intact; on a torn buffer degrade to
         # scenario 3 (render what parsed, never bind) rather than trust spliced identity bytes.
