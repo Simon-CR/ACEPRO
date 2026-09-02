@@ -709,21 +709,43 @@ class AceInstance:
                 pass
 
             if _implausible:
-                self.gcode.respond_info(
-                    "ACE[%s]: Slot %s RFID decode REJECTED (%s) - a version-101 decode that "
-                    "cannot be real. Treating the lane as untagged and fetching the raw image."
-                    % (self.instance_num, slot_idx, "; ".join(_implausible)))
-                logging.warning(
-                    "ace: slot %s implausible native RFID decode rejected (%s) raw sku=%r "
-                    "brand=%r material=%r temp=%r hotbed=%r",
-                    slot_idx, "; ".join(_implausible), sku, brand, material,
-                    rfid_temp, hotbed_temp)
-                self._pending_rfid_queries.discard(slot_idx)
-                try:
-                    self._fetch_raw_tag_image(slot_idx)
-                except Exception:
-                    logging.exception("ace: raw tag fetch failed for slot %s", slot_idx)
-                return
+                # FIRMWARE-INJECTED SKU (extract stub, V1.1.3Z+): a CLEAN "SM<n>" lands in an
+                # otherwise-garbage OpenSpool record - version 101, trustworthy sku, but the
+                # sibling temp/material/hotbed are OpenSpool bytes misread as Anycubic fields. That
+                # is NOT a corrupt native decode: the sku is real and the backend is authoritative
+                # for everything else. Detect a clean SM<n>/<n> sku; if so, trust ONLY the sku, drop
+                # the garbage siblings (so the heater can NEVER be seeded from them), and fall
+                # through to the normal sku bind. Otherwise reject to the raw-image render as before.
+                _sku_s = (sku or "").strip()
+                _sku_digits = _sku_s[2:] if _sku_s.upper().startswith("SM") else _sku_s
+                _sku_clean = (1 <= len(_sku_digits) <= 7) and _sku_digits.isdigit()
+                if _sku_clean:
+                    self.gcode.respond_info(
+                        "ACE[%d]: Slot %d version-101 record has a clean injected sku %r with "
+                        "garbage sibling fields (%s) - trusting the sku only; backend authoritative "
+                        "for temp/material." % (self.instance_num, slot_idx, sku,
+                                                "; ".join(_implausible)))
+                    material = None          # backend authoritative; never use garbage tag fields
+                    brand = None
+                    have_temp_data = False   # so the temp-seed below cannot set inv["temp"]=garbage
+                    rfid_temp = 0
+                    hotbed_temp = None
+                else:
+                    self.gcode.respond_info(
+                        "ACE[%s]: Slot %s RFID decode REJECTED (%s) - a version-101 decode that "
+                        "cannot be real. Treating the lane as untagged and fetching the raw image."
+                        % (self.instance_num, slot_idx, "; ".join(_implausible)))
+                    logging.warning(
+                        "ace: slot %s implausible native RFID decode rejected (%s) raw sku=%r "
+                        "brand=%r material=%r temp=%r hotbed=%r",
+                        slot_idx, "; ".join(_implausible), sku, brand, material,
+                        rfid_temp, hotbed_temp)
+                    self._pending_rfid_queries.discard(slot_idx)
+                    try:
+                        self._fetch_raw_tag_image(slot_idx)
+                    except Exception:
+                        logging.exception("ace: raw tag fetch failed for slot %s", slot_idx)
+                    return
 
             if 0 <= slot_idx < self.SLOT_COUNT:
                 inv = self.inventory[slot_idx]
