@@ -350,6 +350,9 @@ class AceInstance:
         # Last normalised UID observed per slot, for the R2 paired-antenna anticollision check
         # (slots 0+1 and 2+3 share one reader). Refreshed on every UID-bearing decode.
         self._slot_uid = {}
+        # Fix 2: per-slot count of consecutive cross-lane (neighbour's tag) reads, so a
+        # stationary lane gives up instead of re-reading forever. Reset on an accepted read.
+        self._rfid_xlane_retry = {}
         self.status_failure_threshold = max(
             1,
             int(ace_config.get("status_failure_threshold", 4)),
@@ -544,6 +547,24 @@ class AceInstance:
         request = self.protocol.build_get_info_request()
         self.send_high_prio_request(request, self.serial_mgr.handle_info_response)
 
+    RFID_XLANE_MAX_RETRY = 6
+
+    def _read_belongs_to_other_lane(self, slot_idx, sku):
+        """The OTHER slot whose accepted inventory already holds this non-empty SKU, or None.
+
+        Global (not paired-only): the shared antenna leaks a paired neighbour, and the shared
+        page buffer can leak across readers. A blank SKU is no evidence. Case-folded/trimmed.
+        """
+        key = (sku or "").strip().upper()
+        if not key:
+            return None
+        for other in range(self.SLOT_COUNT):
+            if other == slot_idx:
+                continue
+            if (self.inventory[other].get("sku") or "").strip().upper() == key:
+                return other
+        return None
+
     def _handle_rfid_info_response(self, slot_idx, response):
         """Apply a get_filament_info response to the local inventory."""
         self._pending_rfid_queries.discard(slot_idx)
@@ -706,6 +727,36 @@ class AceInstance:
 
             if 0 <= slot_idx < self.SLOT_COUNT:
                 inv = self.inventory[slot_idx]
+
+                # FIX 2: CROSS-LANE READ -> RE-READ AS THE SPOOL ROTATES. A native decode whose SKU
+                # already belongs to ANOTHER lane is the neighbour's tag answering the shared coil,
+                # not this lane's. Do NOT adopt it. Clear the rfid flag so the false->detected gate
+                # reopens and the scanner re-reads on the next tick; during a load the lane's own
+                # spool is turning, so its own tag arrives in the coil within a few ticks. Bounded:
+                # a STATIONARY lane reads the same neighbour every time and, after a few tries,
+                # gives up and stays unbound (the shim bind guard is the backstop) rather than
+                # storming. No handoff happens on a rejected read, so this costs only cmd-68 reads.
+                other = self._read_belongs_to_other_lane(slot_idx, sku)
+                if other is not None:
+                    n = self._rfid_xlane_retry.get(slot_idx, 0) + 1
+                    self._rfid_xlane_retry[slot_idx] = n
+                    self._pending_rfid_queries.discard(slot_idx)
+                    if n <= self.RFID_XLANE_MAX_RETRY:
+                        inv["rfid"] = False   # reopen the re-read gate
+                        self.gcode.respond_info(
+                            "ACE[%d]: Slot %d read SKU %s which is lane %d's - the shared coil "
+                            "answered the neighbour. Re-reading as this lane's spool turns (%d/%d)."
+                            % (self.instance_num, slot_idx, sku, other, n,
+                               self.RFID_XLANE_MAX_RETRY))
+                    else:
+                        self.gcode.respond_info(
+                            "ACE[%d]: Slot %d kept reading lane %d's tag (%s) after %d tries - its "
+                            "own tag is not reaching the coil (stationary, or no own tag). Left "
+                            "unbound; assign with MMU_GATE_MAP GATE=%d SPOOLID=<n> or re-load."
+                            % (self.instance_num, slot_idx, other, sku, n, slot_idx))
+                    return
+                # A clean read of this lane's own tag - clear the retry streak.
+                self._rfid_xlane_retry.pop(slot_idx, None)
 
                 if material:
                     inv["material"] = material
