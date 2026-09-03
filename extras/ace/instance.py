@@ -3384,6 +3384,24 @@ class AceInstance:
         except Exception:
             return False
 
+    def _note_staged_delta(self, slot, delta_mm):
+        """Tell the preload guard about motion that bypasses its ACE_FEED/ACE_RETRACT wrappers.
+
+        identify jogs the lane through the driver directly, so the guard's _track never sees it and
+        its staged counter keeps the pre-jog value. That is not cosmetic: the counter is what sizes
+        the NEXT backward move, so a stale-high value asks for hundreds of mm of retract against a
+        lane that has only its grip margin left - i.e. it pulls the tail out of the gears. Update it
+        per accepted chunk so an abort part-way still leaves the counter true.
+        """
+        try:
+            guard = self.printer.lookup_object("ace_preload_guard", None)
+            if guard is None:
+                return
+            guard._staged[slot] = max(0., guard._staged.get(slot, 0.) + delta_mm)
+            guard._persist_staged()
+        except Exception:
+            logging.exception("ace: staged-counter update failed for slot %s", slot)
+
     def identify_by_jog(self, slot, budget_mm=None, feed_speed=12.0, gcmd=None):
         """Lock-in identification for a shared-reader lane (SHARED_READER_ARBITRATION.md).
 
@@ -3457,14 +3475,18 @@ class AceInstance:
                          % (self.instance_num, int(fed), slot))
                     break
                 chunk = min(CHUNK, budget - fed)
+                moved = True
                 if direction > 0:
                     self._feed(slot, chunk, feed_speed)
                 else:
                     try:
                         self._retract_async_verified(slot, chunk, feed_speed)
                     except Exception:
+                        moved = False   # refused after every retry - do not bill it to the budget
                         logging.exception("ace: identify backward chunk refused, slot %s", slot)
-                fed += chunk
+                if moved:
+                    fed += chunk
+                    self._note_staged_delta(slot, chunk * direction)
                 # Let this feed FINISH and the ACE settle before reading: it cannot service a
                 # cmd-68 while feeding (the read times out), so dwell past the feed's own duration,
                 # THEN read while the lane is still. Each _feed stops on its own length (no STOP,
@@ -3480,8 +3502,12 @@ class AceInstance:
                 before = self.inventory[slot].get("sku") if 0 <= slot < self.SLOT_COUNT else None
                 self._handle_rfid_info_response(slot, resp)
                 inv = self.inventory[slot] if 0 <= slot < self.SLOT_COUNT else {}
-                if inv.get("rfid") and inv.get("sku") and inv.get("sku") != before:
-                    return "identified slot %d after %d mm: sku=%s" % (slot, int(fed), inv.get("sku"))
+                if inv.get("rfid") and inv.get("sku"):
+                    # SUCCESS = this jog produced a valid identity. The old test required the sku
+                    # to CHANGE, so a lane already bound to the right spool read back the same
+                    # value and a perfect injected read was reported as "unidentified".
+                    verb = "identified" if inv.get("sku") != before else "confirmed"
+                    return "%s slot %d after %d mm: sku=%s" % (verb, slot, int(fed), inv.get("sku"))
             if not saw_any:
                 return ("slot %d: no tag reached the coil in %d mm of jogging (reads timing out?) "
                         "- left unbound" % (slot, int(fed)))
