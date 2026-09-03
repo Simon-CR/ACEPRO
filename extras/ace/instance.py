@@ -1139,6 +1139,22 @@ class AceInstance:
         if self._rollback_assist_index == slot:
             self._rollback_assist_index = -1
 
+    def _device_slot_detail(self, slot_index):
+        """The device's own report for one slot from the last heartbeat, or None.
+
+        This is the evidence the assist logic must resolve against. The driver's claim and the
+        device's refusal can both be wrong about what is happening - bench-proven 2026-09-04:
+        a second enable on an assisting slot is REFUSED (FORBIDDEN) while the encoder shows
+        ~18mm/s of real feed. Only the slot's own status answers "is it assisting".
+        """
+        try:
+            for _s in (self._info or {}).get("slots", []):
+                if _s.get("index") == slot_index:
+                    return _s.get("status_detail") or _s.get("status")
+        except Exception:
+            pass
+        return None
+
     def _enable_feed_assist(self, slot_index):
         """Enable feed assist for smooth filament loading."""
         # Mode 2 is FORBIDDEN while the slot is rollback_assisting; the firmware wants an
@@ -1149,6 +1165,19 @@ class AceInstance:
         # already running is itself what holds the device 'busy', so the leading
         # wait_ready() must not wait on it. See the guard below.
         _already_assisting = (self._feed_assist_index == slot_index)
+        if _already_assisting and self._device_slot_detail(slot_index) in (
+                "assisting", "shifting"):
+            # Bench-proven 2026-09-04: re-sending the enable to a slot the device is already
+            # assisting gets FORBIDDEN, and the refusal handler then dropped the claim -
+            # leaving the driver reporting -1 while the device fed at ~18mm/s, with every stop
+            # path gated on the claim it had just dropped. That is how GOOSE_PURGE killed the
+            # 2026-09-03 print: its unconditional enable destroyed the working assist the
+            # unpark had verified seconds earlier. The enable is already satisfied; there is
+            # nothing to send and everything to lose by sending it.
+            self.gcode.respond_info(
+                f"ACE[{self.instance_num}]: feed assist already active on slot {slot_index} "
+                f"- not re-sending the enable")
+            return
         self._feed_assist_index = slot_index
         self._feed_assist_topology_position = self.serial_mgr.get_usb_topology_position()
 
@@ -1179,6 +1208,24 @@ class AceInstance:
                 # that mock send_request as a bare Mock() which never calls back, so each would
                 # burn the full response deadline. The residual window is the ~20ms to the ACK;
                 # every guard now waits a full heartbeat (>=1.1s) first, so no guard reads it.
+                # FORBIDDEN is ambiguous: "you may not assist" OR "I am ALREADY assisting"
+                # (the device refuses a mode change while assisting). Dropping the claim on
+                # the second kind is how the operator loses the stop path - every stop is
+                # gated on this index, and _disable_feed_assist returns early when it reads
+                # -1. Resolve against the device before believing the refusal.
+                _dev = self._device_slot_detail(slot_index)
+                if _dev in ("assisting", "shifting"):
+                    self._feed_assist_index = slot_index
+                    try:
+                        self.state.set(
+                            f"ace_feed_assist_index_{self.instance_num}", slot_index)
+                    except Exception:
+                        logging.exception("ace: could not persist feed assist index")
+                    self.gcode.respond_info(
+                        f"ACE[{self.instance_num}]: enable refused ({msg}) but the device "
+                        f"shows slot {slot_index} '{_dev}' - the refusal means ALREADY "
+                        f"assisting; keeping the claim so it can still be stopped")
+                    return
                 self._feed_assist_index = -1
                 self._feed_assist_topology_position = None
                 self._feed_assist_ack_pending = False
@@ -2411,6 +2458,71 @@ class AceInstance:
         self._extruder_move(extruder_feeding_length, extruder_feeding_speed, wait_for_move_end=True)
         return self.extruder_feeding_length
 
+    def _extruder_push_verified(self, slot, total_mm, speed, what="melt-zone push"):
+        """Push filament with the extruder in chunks, each verified at the hub encoder.
+
+        THE INVARIANT (Simon, 2026-09-03, after a buckle and a grind on the same day): neither
+        actuator may move filament further than the inline buffer can absorb (~3mm) without
+        positive evidence the other end is following. "Armed", device "busy" and the driver's
+        own claim are NOT evidence - bench-proven 2026-09-04, when all three read quiet while
+        554mm free-fed through the hub. Real filament through the hub encoder is.
+
+        Two-sided, because either direction alone folds filament:
+          - STARVATION (hub delta far below the chunk): the ACE is not paying out, so the
+            extruder is consuming the buffer and will then grind the strand at its nip. Caught
+            after one chunk (~10mm) instead of after 90.
+          - OVERRUN (hub delta far above the chunk): the ACE is free-running past the hub
+            faster than the extruder takes it, and the surplus folds in the hub - the
+            2026-09-03 buckle. Blind-stop the assist (the one stop that works with no valid
+            claim) and abort.
+
+        No encoder configured -> the legacy single move, loudly, so machines without the RDM
+        wheel keep working but nobody mistakes that for verification.
+        """
+        enc = self.printer.lookup_object("ace_hub_encoder", None)
+        if enc is None:
+            self.gcode.respond_info(
+                f"ACE[{self.instance_num}]: no hub encoder - {what} of {total_mm:.0f}mm runs "
+                f"UNVERIFIED (cannot prove the lane is following)")
+            self._extruder_move(total_mm, speed, wait_for_move_end=True)
+            return
+
+        def _dist():
+            try:
+                return float(enc.get_status(self.reactor.monotonic()).get("distance_mm", 0.0))
+            except Exception:
+                return 0.0
+
+        CHUNK = 10.0
+        SLOP = 5.0           # buffer travel (~3mm) + edge quantisation
+        pushed = 0.0
+        first = True
+        while pushed < total_mm - 1e-6:
+            c = min(CHUNK, total_mm - pushed)
+            d0 = _dist()
+            self._extruder_move(c, speed, wait_for_move_end=True)
+            # let the last edges land; the counter is event-driven but the read is polled
+            self.reactor.pause(self.reactor.monotonic() + 0.4)
+            delta = _dist() - d0
+            pushed += c
+            grace = SLOP * (2.0 if first else 1.0)
+            first = False
+            if delta > c * 2.0 + grace:
+                try:
+                    self._stop_rollback_assist(slot)   # blind opcode-9 stop, needs no claim
+                except Exception:
+                    logging.exception("ace: blind stop after overrun failed")
+                raise ValueError(
+                    f"ACE[{self.instance_num}]: {what} OVERRUN on slot {slot} - hub saw "
+                    f"{delta:.1f}mm for a {c:.0f}mm chunk. The ACE is free-running; assist "
+                    f"stopped blind. Check the hub for a fold before continuing.")
+            if delta < max(0.0, (c - grace)) * 0.4:
+                raise ValueError(
+                    f"ACE[{self.instance_num}]: {what} STARVED on slot {slot} - hub saw only "
+                    f"{delta:.1f}mm for a {c:.0f}mm chunk after {pushed - c:.0f}mm ok. The lane "
+                    f"is not paying out; stopping before the extruder grinds it. Verify assist "
+                    f"is actually delivering (device slot detail, not the flag) and retry.")
+
     def unpark_to_nozzle(self, slot, target_temp=0):
         """Advance a PARKED tip from post-gear into the melt zone.
 
@@ -2439,8 +2551,9 @@ class AceInstance:
             f"ACE[{self.instance_num}]: unparking slot {slot} - "
             f"{self.toolhead_full_purge_length:.0f}mm post-gear to nozzle"
         )
-        self._extruder_move(self.toolhead_full_purge_length,
-                            self.toolhead_slow_loading_speed, wait_for_move_end=True)
+        self._extruder_push_verified(slot, self.toolhead_full_purge_length,
+                                     self.toolhead_slow_loading_speed,
+                                     what="unpark to nozzle")
         return self.toolhead_full_purge_length
 
     def _confirmed_slot_error(self, slot, since=None):
@@ -2465,7 +2578,14 @@ class AceInstance:
     def _wait_assist_active(self, slot, timeout_s):
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            if self._info.get("status") == "busy" and self.protocol.feed_assist_causes_busy():
+            # 'busy' is DEVICE-WIDE and has other causes (a feed, a preload, another
+            # slot's assist). On its own it proved nothing about this slot - it is the exact
+            # term that passed the 2026-09-03 unpark with nothing armed at all. Require the
+            # driver's claim to name this slot as well; the per-slot check below stays the
+            # stronger arm.
+            if (self._info.get("status") == "busy"
+                    and self.protocol.feed_assist_causes_busy()
+                    and self._feed_assist_index == slot):
                 return True
             for s in self._info.get("slots", []):
                 if s.get("index") == slot:
@@ -2684,10 +2804,11 @@ class AceInstance:
             f"ACE[{self.instance_num}]: Feeding from sensor to nozzle..."
         )
 
-        self._extruder_move(
+        self._extruder_push_verified(
+            local_slot,
             self.toolhead_full_purge_length,
-            self.toolhead_slow_loading_speed
-        )
+            self.toolhead_slow_loading_speed,
+            what="sensor-to-nozzle fill")
 
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.wait_moves()
