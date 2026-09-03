@@ -353,6 +353,10 @@ class AceInstance:
         # Fix 2: per-slot count of consecutive cross-lane (neighbour's tag) reads, so a
         # stationary lane gives up instead of re-reading forever. Reset on an accepted read.
         self._rfid_xlane_retry = {}
+        # Per-reader lock-in identification owner: reader_idx (slot//2) -> the slot being
+        # identified by identify_by_jog right now, or absent/-1. Serializes the shared coil
+        # (slots 0+1, 2+3) and gates the autonomous read. See SHARED_READER_ARBITRATION.md.
+        self._reader_id_owner = {}
         self.status_failure_threshold = max(
             1,
             int(ace_config.get("status_failure_threshold", 4)),
@@ -659,12 +663,36 @@ class AceInstance:
             action = classify_tag_version(version)
 
             if action == "raw":
-                # 0x0202: firmware cached a non-Anycubic image. Fetch and decode it by format.
-                self.gcode.respond_info(
-                    "ACE[%d]: Slot %d carries a non-Anycubic tag - fetching its raw image"
-                    % (self.instance_num, slot_idx))
-                self._fetch_raw_tag_image(slot_idx)
-                return
+                # FIRMWARE-INJECTED SKU ON THE NON-ANYCUBIC PATH. If the firmware wrote a clean
+                # "SM<n>" identity alongside the 0x0202 sentinel, that identity is authoritative
+                # AND synchronous: bind from it and skip the op-9 raw walk entirely. That walk is
+                # ~2.88s (no synchronous caller can wait on it - it is exactly what outran the
+                # motion-gated identify loop), torn-prone (a firmware scan splices the R5 buffer)
+                # and cross-reader-contaminated (slot 3 once returned slot 0's SM22) - binding off
+                # it is the wrong-bind the design forbids. The positional siblings are OpenSpool
+                # bytes misread as Anycubic fields, so they are nulled BEFORE routing to the native
+                # path: R1 holds, no foreign field can reach the heater. Inert until the firmware
+                # actually injects on this path (today sku is empty here -> raw fetch as before).
+                _s = (sku or "").strip()
+                _d = _s[2:] if _s.upper().startswith("SM") else _s
+                if (1 <= len(_d) <= 7) and _d.isdigit():
+                    self.gcode.respond_info(
+                        "ACE[%d]: Slot %d non-Anycubic tag carries a firmware-injected sku %r - "
+                        "binding from it, skipping the raw-image walk"
+                        % (self.instance_num, slot_idx, _s))
+                    material = None          # backend authoritative; never trust foreign bytes
+                    brand = None
+                    have_temp_data = False   # R1: the temp-seed below can never fire
+                    rfid_temp = 0
+                    hotbed_temp = None
+                    action = "native"        # fall through to the proven sku bind + its guards
+                else:
+                    # 0x0202 with no injected identity: fetch and decode the image by format.
+                    self.gcode.respond_info(
+                        "ACE[%d]: Slot %d carries a non-Anycubic tag - fetching its raw image"
+                        % (self.instance_num, slot_idx))
+                    self._fetch_raw_tag_image(slot_idx)
+                    return
 
             if action == "bambu":
                 # 0x0201: result["sku"] IS the tag UID as hex; no usable material/temp. Route to
@@ -3299,6 +3327,170 @@ class AceInstance:
         rec_uid["uid"] = uid
         self._handoff_to_moonraker(slot_idx, rec_uid, uid=uid, native=False)
 
+    # ------------------------------------------------------------------ #
+    # Lock-in shared-reader identification. See SHARED_READER_ARBITRATION.md #
+    # ------------------------------------------------------------------ #
+    def _identify_read_sync(self, slot, deadline_s=1.5):
+        """Issue a live cmd-68 FILAMENT_IDENTIFY and block cooperatively for the reply.
+
+        Returns (code, response). code 0 = a tag is in the coil now (response['result'] carries
+        sku/version/index); 3 = SELECT failed (nothing in the field); 4/6 = anticollision /
+        read-refused. COMMAND CONTEXT ONLY - the reactor.pause loop must never run inside a
+        response callback.
+        """
+        rc = {"resp": None, "done": False}
+        def _cb(response, rc=rc):
+            rc["resp"] = response
+            rc["done"] = True
+        try:
+            req = self.protocol._build_command_request("FILAMENT_IDENTIFY", {"index": slot})
+            self.send_request(req, _cb)
+        except Exception:
+            logging.exception("ace: identify read send failed for slot %s", slot)
+            return -1, None
+        end = self.reactor.monotonic() + deadline_s
+        while not rc["done"] and self.reactor.monotonic() < end:
+            self.reactor.pause(self.reactor.monotonic() + 0.05)
+        resp = rc["resp"]
+        try:
+            code = int((resp or {}).get("code", -1))
+        except (TypeError, ValueError):
+            code = -1
+        return code, resp
+
+    @staticmethod
+    def _read_tag_key(resp):
+        """A stable identity for the tag a cmd-68 read returned, or None. Distinguishes a tag
+        that appeared BECAUSE of a jog (correlated) from a static parked-sibling tag."""
+        try:
+            result = (resp or {}).get("result") or {}
+            sku = result.get("sku")
+            if sku:
+                return "sku:%s" % str(sku).strip()
+            ver = result.get("version")
+            if ver is not None:
+                return "ver:%s" % ver
+        except Exception:
+            pass
+        return None
+
+    def _hub_is_blocked(self):
+        """True if the shared hub sensor reports filament present - do not jog forward into it."""
+        try:
+            s = self.printer.lookup_object("filament_switch_sensor hub_detect", None)
+            if s is None:
+                return False
+            return bool(getattr(getattr(s, "runout_helper", None), "filament_present", False))
+        except Exception:
+            return False
+
+    def identify_by_jog(self, slot, budget_mm=None, feed_speed=12.0, gcmd=None):
+        """Lock-in identification for a shared-reader lane (SHARED_READER_ARBITRATION.md).
+
+        ONE continuous forward feed (not rapid stop-start jogs, which the ACE FORBIDs) while
+        polling a synchronous cmd-68 (V1.1.40+ injects sm_id on that path, so an OpenSpool read is
+        clean, not torn). A read (code 0) whose identity differs from the pre-feed baseline appeared
+        BECAUSE of our rotation -> this lane's; it goes to the normal decode path (R2 / Fix-2 /
+        anticollision / plausibility + moonraker handoff). A read matching the baseline is the
+        static parked sibling -> filtered. The forward distance is capped up front to
+        (hub - staged - margin) so the tip can NEVER reach the hub. COMMAND CONTEXT ONLY.
+        """
+        reader = slot // 2
+        owner = self._reader_id_owner.get(reader, -1)
+        if owner not in (-1, slot):
+            return "reader %d busy identifying slot %d - retry after it finishes" % (reader, owner)
+
+        def _say(msg):
+            (gcmd.respond_info if gcmd is not None else self.gcode.respond_info)(msg)
+
+        # Pick the jog DIRECTION with the most rotation room, then cap it. Reading needs ~a full
+        # spool rotation for the tag to sweep the coil; forward room ends at the hub (buckle risk),
+        # so a lane near the hub is jogged BACKWARD toward park instead - more room, and a retract
+        # can never buckle. Derived from the persisted geometry.
+        fwd_room = None
+        bwd_room = None
+        try:
+            sv = self.printer.lookup_object("save_variables", None)
+            vals = getattr(sv, "allVariables", {}) if sv is not None else {}
+            staged_list = vals.get("ace_staged_mm") or []
+            if slot < len(staged_list):
+                staged = float(staged_list[slot])
+                hub = (float(vals.get("ace_park_to_entry", 0))
+                       - float(vals.get("ace_cal_hub_to_entry", 0)))
+                if hub > 0:
+                    fwd_room = max(0.0, hub - staged - 90.0)   # to the hub, less a buckle margin
+                bwd_room = max(0.0, staged - 60.0)             # to park, keep it gripped
+        except Exception:
+            logging.exception("ace: identify room calc failed for slot %s", slot)
+        if bwd_room is not None and (fwd_room is None or bwd_room > fwd_room):
+            direction, room, dirname = -1, bwd_room, "backward"
+        else:
+            direction, room, dirname = 1, (fwd_room if fwd_room is not None else 300.0), "forward"
+        budget = room if budget_mm is None else min(budget_mm, room)
+        if budget < 16.0:
+            return ("slot %d has no room to jog (fwd %s / bwd %s mm) - reposition it first"
+                    % (slot, ("%.0f" % fwd_room) if fwd_room is not None else "?",
+                       ("%.0f" % bwd_room) if bwd_room is not None else "?"))
+        if direction > 0 and self._hub_is_blocked():
+            return ("hub already blocked - retract the lane off the hub before identifying slot %d"
+                    % slot)
+
+        self._reader_id_owner[reader] = slot
+        _prev_sync = self.rfid_inventory_sync_enabled
+        self.rfid_inventory_sync_enabled = False   # background sync tears identify reads - pause it
+        try:
+            self._ensure_assists_off_for_motion(slot, "identify")
+            base_code, base_resp = self._identify_read_sync(slot)
+            baseline_key = self._read_tag_key(base_resp) if base_code == 0 else None
+            if baseline_key:
+                _say("ACE[%d]: reader %d baseline holds a STATIC tag (%s) - filtering it as the "
+                     "parked sibling" % (self.instance_num, reader, baseline_key))
+            CHUNK = 12.0
+            _say("ACE[%d]: identifying slot %d - discrete %.0f mm %s jogs, reading while still "
+                 "(the ACE cannot read mid-motion), up to %.0f mm"
+                 % (self.instance_num, slot, CHUNK, dirname, budget))
+            fed = 0.0
+            saw_any = False
+            while fed < budget:
+                if direction > 0 and self._hub_is_blocked():
+                    _say("ACE[%d]: hub reached at %d mm - stopping; slot %d unbound"
+                         % (self.instance_num, int(fed), slot))
+                    break
+                chunk = min(CHUNK, budget - fed)
+                if direction > 0:
+                    self._feed(slot, chunk, feed_speed)
+                else:
+                    try:
+                        self._retract_async_verified(slot, chunk, feed_speed)
+                    except Exception:
+                        logging.exception("ace: identify backward chunk refused, slot %s", slot)
+                fed += chunk
+                # Let this feed FINISH and the ACE settle before reading: it cannot service a
+                # cmd-68 while feeding (the read times out), so dwell past the feed's own duration,
+                # THEN read while the lane is still. Each _feed stops on its own length (no STOP,
+                # so no post-STOP refusal window).
+                self.reactor.pause(self.reactor.monotonic() + (chunk / max(1.0, feed_speed)) + 1.5)
+                code, resp = self._identify_read_sync(slot)
+                if code != 0:
+                    continue
+                saw_any = True
+                key = self._read_tag_key(resp)
+                if key is not None and key == baseline_key:
+                    continue  # static parked-sibling tag
+                before = self.inventory[slot].get("sku") if 0 <= slot < self.SLOT_COUNT else None
+                self._handle_rfid_info_response(slot, resp)
+                inv = self.inventory[slot] if 0 <= slot < self.SLOT_COUNT else {}
+                if inv.get("rfid") and inv.get("sku") and inv.get("sku") != before:
+                    return "identified slot %d after %d mm: sku=%s" % (slot, int(fed), inv.get("sku"))
+            if not saw_any:
+                return ("slot %d: no tag reached the coil in %d mm of jogging (reads timing out?) "
+                        "- left unbound" % (slot, int(fed)))
+            return ("slot %d unidentified after %d mm - bind manually: "
+                    "MMU_GATE_MAP GATE=%d SPOOLID=<n>" % (slot, int(fed), slot))
+        finally:
+            self.rfid_inventory_sync_enabled = _prev_sync
+            self._reader_id_owner[reader] = -1
+
     def _live_read_then_cache(self, slot_idx):
         """Try a LIVE tag read first, and only fall back to the cached record.
 
@@ -3600,7 +3792,8 @@ class AceInstance:
                             # Skip if query is already in-flight
                             query_pending = idx in self._pending_rfid_queries
 
-                            if not saved_rfid and not query_pending:
+                            if not saved_rfid and not query_pending \
+                                    and self._reader_id_owner.get(idx // 2, -1) == -1:
                                 updated_rfid = True
                                 # Query get_filament_info - callback will populate all metadata
                                 self._live_read_then_cache(idx)

@@ -643,6 +643,22 @@ def ace_get_instance_and_slot(gcmd):
     raise gcmd.error("Must specify either T=<tool> or INSTANCE=<inst> INDEX=<slot>")
 
 
+def cmd_ACE_IDENTIFY_BY_JOG(gcmd):
+    """TEST: lock-in identify a shared-reader lane by jogging its spool and reading the coil.
+    Binds only the tag correlated with the jog (SHARED_READER_ARBITRATION.md). Not yet wired
+    into auto-load. T=<tool> or INSTANCE= INDEX=, [BUDGET=400] [JOG=8] [SPEED=20] [SETTLE=0.5]."""
+    try:
+        ace, slot = ace_get_instance_and_slot(gcmd)
+        if not (0 <= slot < ace.SLOT_COUNT):
+            raise gcmd.error(f"Invalid slot {slot}")
+        budget = gcmd.get_float("BUDGET", 0.0, minval=0.0, maxval=1500.0)
+        speed = gcmd.get_float("SPEED", 12.0, minval=1.0, maxval=100.0)
+        msg = ace.identify_by_jog(slot, budget_mm=(budget or None), feed_speed=speed, gcmd=gcmd)
+        gcmd.respond_info(f"ACE[{ace.instance_num}]: {msg}")
+    except Exception as e:
+        gcmd.respond_info(f"ACE_IDENTIFY_BY_JOG error: {e}")
+
+
 def cmd_ACE_FEED(gcmd):
     """Feed filament from slot."""
     try:
@@ -2666,6 +2682,8 @@ ACE_COMMANDS = [
      "Re-detect an instance mis-typed at startup (e.g. late ACE2 adapter). Discovery-gated, safe."),
     ("ACE_GET_CURRENT_INDEX", cmd_ACE_GET_CURRENT_INDEX, "Query currently loaded tool index"),
     ("ACE_FEED", cmd_ACE_FEED, "Feed filament. T=<tool> or INSTANCE= INDEX=, LENGTH=, [SPEED=]"),
+    ("ACE_IDENTIFY_BY_JOG", cmd_ACE_IDENTIFY_BY_JOG,
+     "TEST: lock-in identify a shared-reader lane by jogging. T= or INSTANCE= INDEX=, [BUDGET=400] [JOG=8] [SPEED=20] [SETTLE=0.5]"),
     ("ACE_STOP_FEED", cmd_ACE_STOP_FEED, "Stop feeding. T=<tool> or INSTANCE= INDEX="),
     ("ACE_RETRACT", cmd_ACE_RETRACT, "Retract filament. T=<tool> or INSTANCE= INDEX=, LENGTH=, [SPEED=]"),
     ("ACE_TANDEM_EXTRACT", cmd_ACE_TANDEM_EXTRACT, "Tandem extract until entry clears. T=, [SPEED=], [CAP=]"),
