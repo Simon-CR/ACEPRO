@@ -1350,7 +1350,8 @@ class AceInstance:
     # No response is a comms problem, and the 3.0s deadline has already elapsed.
     STOP_SETTLE_SILENT_PAUSE_S = 0.5
 
-    def _retract_async_verified(self, slot, length, speed, max_attempts=None):
+    def _retract_async_verified(self, slot, length, speed, max_attempts=None,
+                                refused_pause=None, quiet=False):
         """Start an async retract and return only once the device has ACCEPTED it.
 
         _retract_async fire-and-forgets: a FORBIDDEN lands in a log callback and the caller
@@ -1384,14 +1385,23 @@ class AceInstance:
             if resp and resp.get("code", 0) == 0 and resp.get("msg") != "FORBIDDEN":
                 return
             why = "no response" if not resp else resp.get("msg", "error")
-            self.gcode.respond_info(
-                f"ACE[{self.instance_num}]: tandem retract not accepted "
-                f"(attempt {attempt}/{max_attempts}: {why}) - extruder held still")
+            msg = (f"ACE[{self.instance_num}]: tandem retract not accepted "
+                   f"(attempt {attempt}/{max_attempts}: {why}) - extruder held still")
+            if quiet:
+                # A caller doing many small retracts of its own (identify) produces one of
+                # these per chunk. They are expected, they name an extruder that is not
+                # involved, and 31 of them per run buries the one line that matters.
+                logging.info("ace: %s", msg)
+            else:
+                self.gcode.respond_info(msg)
             # See STOP_SETTLE_ATTEMPTS: a prompt FORBIDDEN needs the long pause, silence
-            # does not (its deadline already elapsed).
+            # does not (its deadline already elapsed). But the long pause is sized for the
+            # POST-STOP refuse window - a caller that never issues a STOP has no such window
+            # and should not pay 3s per refusal for a hazard it cannot have.
+            _refused = (self.STOP_SETTLE_REFUSED_PAUSE_S if refused_pause is None
+                        else refused_pause)
             self.reactor.pause(self.reactor.monotonic() + (
-                self.STOP_SETTLE_SILENT_PAUSE_S if resp is None
-                else self.STOP_SETTLE_REFUSED_PAUSE_S))
+                self.STOP_SETTLE_SILENT_PAUSE_S if resp is None else _refused))
         raise ValueError(
             f"ACE[{self.instance_num}]: device refused the tandem retract {max_attempts}x "
             f"({why}) - aborting BEFORE the extruder pulls against a clamped lane")
@@ -3498,7 +3508,7 @@ class AceInstance:
             if baseline_key:
                 _say("ACE[%d]: reader %d baseline holds a STATIC tag (%s) - filtering it as the "
                      "parked sibling" % (self.instance_num, reader, baseline_key))
-            CHUNK = 12.0
+            CHUNK = 40.0
             _say("ACE[%d]: identifying slot %d - discrete %.0f mm %s jogs, reading while still "
                  "(the ACE cannot read mid-motion), up to %.0f mm"
                  % (self.instance_num, slot, CHUNK, dirname, budget))
@@ -3514,7 +3524,12 @@ class AceInstance:
                     self._feed(slot, chunk, feed_speed)
                 else:
                     try:
-                        self._retract_async_verified(slot, chunk, feed_speed)
+                        # No STOP is ever issued here (each jog ends on its own length), so
+                        # the post-STOP backoff does not apply - measured, it was 31 refusals
+                        # x 3s = 94s of a 642s run. quiet: these refusals are expected and
+                        # would otherwise drown the result.
+                        self._retract_async_verified(slot, chunk, feed_speed,
+                                                     refused_pause=0.3, quiet=True)
                     except Exception:
                         moved = False   # refused after every retry - do not bill it to the budget
                         logging.exception("ace: identify backward chunk refused, slot %s", slot)
