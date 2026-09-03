@@ -142,3 +142,101 @@ final unbound fallback.
 2. Add the nudge escalation (state-aware) + the parked-at-hub backward + re-park.
 3. Add the print-time known-tag filter (identify-while-printing).
 4. Optional: the firmware present/absent tick for hardware-grade correlation.
+
+---
+
+# What actually happened (2026-09-02/03)
+
+Step 1 of the build order was implemented and run on hardware. This section records the
+outcome, including the parts that did not work, because most of the cost of this exercise was
+in discovering them.
+
+## The firmware defect that made the whole thing look impossible
+
+`identify_by_jog` kept reading a tag and getting `sku=None`, while the SAME tag read moments
+later by the background worker resolved perfectly. The cause was not the arbitration logic and
+not the ACE: it was **our own patch**.
+
+`rawtag_stub`'s "not Anycubic" branch committed the `0x0202` raw-image sentinel and branched
+straight to `epilogue`, so it never reached `resume` and therefore never reached the `sm_id`
+inject at `0x0800E8A2` — which sits on the Anycubic-SUCCESS path, after the native sku/version
+stores. **Every foreign/OpenSpool tag bypassed the inject by construction on the live-read
+path.** Fixed in firmware V1.1.41 by searching `0x20000704` for `sm_id` before committing the
+sentinel and answering like a native decode (`version 101` + `"SM<n>"`). See
+`ace2-pro-firmware-research/docs/01-firmware-patches.md`.
+
+Lesson worth carrying: when one code path resolves a tag and another does not, suspect the
+patch before the hardware.
+
+## Three motion facts, each of which hid the next
+
+1. **The ACE cannot service a `cmd-68` while it is moving** — the read times out. A single
+   continuous feed while polling therefore never works. It has to be discrete: move, stop,
+   read.
+2. **A read needs roughly a full spool revolution** for the tag to sweep the coil. Forward room
+   ends at the hub, so a lane parked near the hub could only travel 236 mm — under one turn,
+   and the tag never reached the coil at all. The jog now picks whichever direction has more
+   room (backward toward park for a near-hub lane).
+3. **`_retract_async` is fire-and-forget and silently drops refusals.** 12 of 25 chunks were
+   lost to the ACE's post-STOP refuse window with no error anywhere, so the spool never
+   completed a rotation. Only the retrying variant actually rotates.
+
+## What it cost, and why that matters more than the duration
+
+First working run: **642 s to move 384 mm** — 0.60 mm/s effective against 12 mm/s commanded,
+with only 32 s of that being motion. Causes, in order of size:
+
+- a 3.0 s post-STOP backoff paid on 31 of 32 chunks, for a STOP `identify_by_jog` never issues
+  (each jog ends on its own commanded length);
+- a 12 mm chunk, which turns a full spool about 7.2°, against a tag window measured near 45°
+  (4 of ~32 reads landed) — so most stops sampled nowhere near the coil;
+- `_identify_read_sync` abandoning at 1.5 s while the transport holds the request for its full
+  5.0 s timeout (`serial_manager` has no per-request timeout), leaving a bus slot held for a
+  reply nobody is waiting for.
+
+The first two are fixed (40 mm chunk, `refused_pause=0.3`). The real problem was never the
+clock though — it was the **variance**. Another run confirmed on the first chunk. "Sometimes
+instant, sometimes eleven minutes" is the design smell.
+
+## The reframing: identify is a fallback, not the main path
+
+A normalize already feeds the lane ~434 mm to the hub and backs off, the firmware worker reads
+the tag during that rotation, and `_fetch_tag` collects it 2.5 s later via `ACE_SCAN_TAG`.
+**That is the path that binds lanes in normal operation.** So `identify_by_jog` is largely
+redundant for any lane that gets normalized, and its real niche is narrow: resolving *which*
+lane a read belongs to when the shared reader is ambiguous, using motion correlation.
+
+Sequence future orchestration accordingly — normalize-then-fetch first, `identify_by_jog` only
+when that produced nothing or the pairing is ambiguous.
+
+## Normalizing is a speed optimization, not a precondition
+
+A lane that has not been normalized is still perfectly usable. Normalizing shortens the next
+reload to `park_offset + hub->entry` instead of the whole bowden; it is not a safety gate. A
+load is **self-locating**: it feeds toward instrumented points (hub switch, then toolhead entry
+switch) and discovers position on the way. Crossing the hub re-anchors the counter, so a lane
+called on to load while still queued for calibration simply complies and calibrates in passing.
+
+The one operation that genuinely needs a datum first is **sweep-drying**, because it rolls back
+and forth on the ACE side of park without crossing any sensor — a known datum is the only thing
+bounding its motion. That gate lives in `ace_dryroll.cfg` (`ace_dryroll_datum`), not here.
+
+## Deferred park is now a queue
+
+`identify_by_jog` does not call `ACE_LANE_NORMALIZE` directly — that fails, subtly: lane status
+comes from a 1 Hz heartbeat, so immediately after the last retract chunk the lane still reads
+`unwinding` and normalize refuses on its readiness gate. It hands the lane to the path guard's
+**ordered normalize queue** instead, which drains on its own poll once the lane really is ready
+and the shared path is clear. Ordering is the schedule and is persisted; an operator or the
+printer can promote, append or drop entries; a refused normalize is re-queued and retried, with
+a cap so a lane that can never park is retired rather than spun on forever.
+
+## Still open
+
+- The `identify_by_jog` read deadline / transport timeout mismatch above.
+- Steps 2-4 of the build order (nudge escalation, print-time known-tag filter, the firmware
+  present/absent tick) are **not** implemented.
+- `_hub_expected_busy()` is simply "is a print running", with no gcode lookahead — so the queue
+  cannot drain during a print, and `_ACE_DRYROLL_PREPARE_PARK` must still schedule the hub
+  itself because it runs inside `PRINT_START`.
+
