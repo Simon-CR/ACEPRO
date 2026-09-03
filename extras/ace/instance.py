@@ -3402,6 +3402,40 @@ class AceInstance:
         except Exception:
             logging.exception("ace: staged-counter update failed for slot %s", slot)
 
+    def _repark_after_identify(self, slot, moved_mm):
+        """Return the lane to its sensor-defined park datum once identify is done with it.
+
+        Identify deliberately drives the lane off its datum, so stopping there would leave the
+        operator to finish the job by hand, leave ace_lane_pos claiming "parked" when it is not,
+        and leave the next move sizing itself against a lane that is not where the flag says. This
+        runs from the finally, so an abort or an exception re-parks too - the routine never exits
+        having left the lane somewhere undefined.
+
+        Calling ACE_LANE_NORMALIZE directly from here does NOT work, and the failure is subtle:
+        the lane's status comes from a 1Hz heartbeat, so in the same tenth of a second the last
+        retract chunk ends the lane still reads "unwinding" and normalize refuses on its readiness
+        gate. Nothing is wrong with the path - we simply asked too early. So hand it to the guard's
+        normalize QUEUE instead, which drains on its own poll once the lane really is ready and the
+        shared path is clear, and which keeps the entry across a restart.
+
+        This matters more than tidiness: identify only ever jogs a lane FURTHER from park, so a
+        re-park that silently fails means every run walks the lane backward and the next run has
+        less room, until it reaches the grip reserve and identify can no longer move at all.
+        """
+        if moved_mm <= 0.:
+            return          # never moved; already at its datum
+        try:
+            guard = self.printer.lookup_object("ace_preload_guard", None)
+            if guard is not None:
+                guard.queue_normalize(slot, front=True,
+                                      reason="identify jogged the lane off park")
+                return
+        except Exception:
+            logging.exception("ace: could not queue a normalize for slot %s", slot)
+        self.gcode.respond_info(
+            "ACE[%d]: slot %d is ~%dmm off park and no path guard is loaded to re-park it - "
+            "run ACE_LANE_NORMALIZE T=%d" % (self.instance_num, slot, int(moved_mm), slot))
+
     def identify_by_jog(self, slot, budget_mm=None, feed_speed=12.0, gcmd=None):
         """Lock-in identification for a shared-reader lane (SHARED_READER_ARBITRATION.md).
 
@@ -3456,6 +3490,7 @@ class AceInstance:
         self._reader_id_owner[reader] = slot
         _prev_sync = self.rfid_inventory_sync_enabled
         self.rfid_inventory_sync_enabled = False   # background sync tears identify reads - pause it
+        fed = 0.0          # declared out here so the finally's re-park knows how far we drove
         try:
             self._ensure_assists_off_for_motion(slot, "identify")
             base_code, base_resp = self._identify_read_sync(slot)
@@ -3467,7 +3502,6 @@ class AceInstance:
             _say("ACE[%d]: identifying slot %d - discrete %.0f mm %s jogs, reading while still "
                  "(the ACE cannot read mid-motion), up to %.0f mm"
                  % (self.instance_num, slot, CHUNK, dirname, budget))
-            fed = 0.0
             saw_any = False
             while fed < budget:
                 if direction > 0 and self._hub_is_blocked():
@@ -3516,6 +3550,7 @@ class AceInstance:
         finally:
             self.rfid_inventory_sync_enabled = _prev_sync
             self._reader_id_owner[reader] = -1
+            self._repark_after_identify(slot, fed)
 
     def _live_read_then_cache(self, slot_idx):
         """Try a LIVE tag read first, and only fall back to the cached record.
