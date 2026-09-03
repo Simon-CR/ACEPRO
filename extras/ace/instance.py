@@ -861,7 +861,12 @@ class AceInstance:
                     inv["brand"] = brand
                 if icon_type is not None:
                     inv["icon_type"] = icon_type
-                if extruder_temp:
+                # R1 CHOKE POINT. have_temp_data is what every carve-out clears when it
+                # decides the positional fields cannot be trusted - so gate the RAW temperature
+                # block on it too, not just the derived scalar. Three separate carve-outs each
+                # nulled material/brand/rfid_temp/hotbed_temp and all three missed these,
+                # which is the argument for gating in one place instead of remembering a list.
+                if extruder_temp and have_temp_data:
                     inv["extruder_temp"] = extruder_temp
                 if hotbed_temp:
                     inv["hotbed_temp"] = hotbed_temp
@@ -896,8 +901,10 @@ class AceInstance:
                     "material": material or None,
                     "color": ("%02X%02X%02X" % (rfid_color[0], rfid_color[1], rfid_color[2]))
                     if rfid_color else None,
-                    "temp_min": (temp_min or None),
-                    "temp_max": (temp_max or None),
+                    # Same choke point: never hand a consumer a temperature from a record
+                    # whose positional fields we have already decided not to trust.
+                    "temp_min": ((temp_min or None) if have_temp_data else None),
+                    "temp_max": ((temp_max or None) if have_temp_data else None),
                     "bed_min": (hotbed_temp.get("min") or None) if hotbed_temp else None,
                     "bed_max": (hotbed_temp.get("max") or None) if hotbed_temp else None,
                     "diameter": (diameter or None),
@@ -3494,6 +3501,39 @@ class AceInstance:
         owner = self._reader_id_owner.get(reader, -1)
         if owner not in (-1, slot):
             return "reader %d busy identifying slot %d - retry after it finishes" % (reader, owner)
+
+        # NEVER JOG A LOADED LANE. This routine drives the ACE backward while the extruder is
+        # idle - and an idle extruder is a CLAMPED one. That is the 2026-08-27 tandem failure in
+        # mirror image (there the extruder pulled against a clamped ACE; here the ACE pulls
+        # against a clamped extruder), and bwd_room for a loaded lane is most of the bowden.
+        # _retract_async_verified guards the other direction of this hazard and has no idea about
+        # this one: its _is_slot_empty() reads the ACE LANE sensor, not the toolhead.
+        #
+        # Fail CLOSED. An unreadable index or a missing sensor means we cannot rule out a loaded
+        # lane, and "probably not loaded" is not good enough to unwind a metre of filament on.
+        _mgr = getattr(self, "manager", None)
+        try:
+            _cur = int(_mgr.state.get("ace_current_index", -1))
+        except Exception:
+            return ("cannot read the loaded-tool index - refusing to jog slot %d. Identify will "
+                    "not move a lane it cannot prove is unloaded." % slot)
+        if _cur == slot:
+            return ("slot %d IS the loaded tool - refusing to jog it. The extruder is gripping "
+                    "this strand; unwinding the ACE against it is how a toolchange was killed on "
+                    "2026-08-27. Unload the tool first, then identify." % slot)
+        for _name in ("toolhead_entry", "toolhead_postgear"):
+            _sens = self.printer.lookup_object("filament_switch_sensor " + _name, None)
+            if _sens is None:
+                return ("%s is not configured - refusing to jog slot %d, because a loaded lane "
+                        "cannot be ruled out without it" % (_name, slot))
+            try:
+                _present = bool(_sens.runout_helper.filament_present)
+            except Exception:
+                return ("cannot read %s - refusing to jog slot %d" % (_name, slot))
+            if _present:
+                return ("%s still reads filament - refusing to jog slot %d until the toolhead is "
+                        "clear (something is loaded, even if the index disagrees)"
+                        % (_name, slot))
 
         def _say(msg):
             (gcmd.respond_info if gcmd is not None else self.gcode.respond_info)(msg)
