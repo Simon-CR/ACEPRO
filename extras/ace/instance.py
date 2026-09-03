@@ -37,6 +37,12 @@ from .serial_manager import AceSerialManager
 NATIVE_TAG_VERSION = 101       # 0x65: Anycubic positional decode - the ONLY trusted layout (R1)
 BAMBU_UID_SENTINEL = 0x0201    # 513: firmware handed the tag UID back as hex in result["sku"]
 RAW_TAG_SENTINEL_V = 0x0202    # 514: non-Anycubic tag, raw image cached (== AceInstance.RAW_TAG_SENTINEL)
+INJECTED_SKU_SENTINEL = 0x0203 # 515: firmware found an sm_id and wrote it to sku. The sku is
+                               # authoritative; EVERY other field in the record is the stock
+                               # positional parse of a tag that is not in Anycubic's layout,
+                               # i.e. garbage. Firmware V1.1.42+ emits this instead of 101.
+                               # Claiming 101 was a lie that only OUR host knew to discount -
+                               # any other consumer would have read a heat target out of it.
 
 # Formats whose parsed fields describe a real filament and MAY seed a heat target. Deliberately
 # excludes unknown/ndef/ndef-json/blank/bambu: a generic or unproven decode renders, never heats.
@@ -58,8 +64,9 @@ def _normalise_uid_local(uid):
 def classify_tag_version(version):
     """Map a GET_FILAMENT_INFO `version` to the capture action. The R1 heater whitelist.
 
-    Returns "native" | "bambu" | "raw" | "foreign". Positional temp/material fields may be
-    trusted ONLY for "native"; every other result routes to UID resolution or a raw-image fetch.
+    Returns "native" | "bambu" | "raw" | "injected" | "foreign". Positional temp/material fields
+    may be trusted ONLY for "native"; every other result routes to UID resolution, a raw-image
+    fetch, or - for "injected" - the sku alone.
     """
     try:
         v = int(version or 0)
@@ -71,6 +78,8 @@ def classify_tag_version(version):
         return "bambu"
     if v == RAW_TAG_SENTINEL_V:
         return "raw"
+    if v == INJECTED_SKU_SENTINEL:
+        return "injected"
     return "foreign"
 
 
@@ -693,6 +702,30 @@ class AceInstance:
                         % (self.instance_num, slot_idx))
                     self._fetch_raw_tag_image(slot_idx)
                     return
+
+            if action == "injected":
+                # 0x0203: the firmware found an sm_id on a foreign tag and wrote it to sku. The
+                # sku is real; the siblings are the stock positional parse of a layout this tag
+                # does not use, so they are garbage BY CONSTRUCTION - not "probably wrong".
+                # Trust the sku, drop everything else, and never let a temp out of here.
+                _s = (sku or "").strip()
+                _d = _s[2:] if _s.upper().startswith("SM") else _s
+                if not ((1 <= len(_d) <= 7) and _d.isdigit()):
+                    self.gcode.respond_info(
+                        "ACE[%d]: Slot %d reports an injected sku %r that is not SM<n>/<n> - "
+                        "treating the lane as untagged" % (self.instance_num, slot_idx, sku))
+                    self._pending_rfid_queries.discard(slot_idx)
+                    return
+                self.gcode.respond_info(
+                    "ACE[%d]: Slot %d carries a firmware-injected sku %s - binding from it "
+                    "(backend authoritative for material and temperature)"
+                    % (self.instance_num, slot_idx, _s))
+                material = None
+                brand = None
+                have_temp_data = False   # R1: the temp-seed below cannot fire
+                rfid_temp = 0
+                hotbed_temp = None
+                action = "native"        # fall through to the proven sku bind and its guards
 
             if action == "bambu":
                 # 0x0201: result["sku"] IS the tag UID as hex; no usable material/temp. Route to
