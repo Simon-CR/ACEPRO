@@ -2493,10 +2493,29 @@ class AceInstance:
             except Exception:
                 return 0.0
 
+        # v2, 2026-09-04. v1 used a 40% per-chunk floor borrowed from a tag-read heuristic;
+        # a 77%-delivery bleed passed all nine chunks while the operator HEARD the slip. A slip
+        # is a deficit that accumulates, not a binary stall, so v2 judges four ways and logs
+        # every chunk (v1's pass path logged nothing - the bleed was invisible until audible).
+        # Thresholds are derived from measurement, not convenience:
+        #   SLOP 4mm        one-time: buffer travel ~3mm + edge quantisation ~1mm
+        #   floor 70%       healthy engaged chunks measure ~10/10; first chunk legitimately
+        #                   dips while the buffer tensions (measured 7.5) so it is exempt
+        #   rolling 80%/3   catches a uniform bleed noise can hide from the floor: today's
+        #                   77% trace trips this at chunk 4 (replayed offline against the
+        #                   recorded numbers); a healthy 7.5,9.1,9.2,9.8.. trace passes
+        #   deficit 8mm     absolute backstop: total commanded-minus-delivered beyond slop
         CHUNK = 10.0
-        SLOP = 5.0           # buffer travel (~3mm) + edge quantisation
+        SLOP = 4.0
+        MAX_DEFICIT = 8.0
         pushed = 0.0
-        first = True
+        delivered = 0.0
+        hist = []
+        def _fail(kind, msg):
+            raise ValueError(
+                f"ACE[{self.instance_num}]: {what} {kind} on slot {slot} - {msg} "
+                f"(delivered {delivered:.1f}/{pushed:.0f}mm, chunks {hist}). Inspect the "
+                f"strand at the extruder gears before retrying.")
         while pushed < total_mm - 1e-6:
             c = min(CHUNK, total_mm - pushed)
             d0 = _dist()
@@ -2505,23 +2524,57 @@ class AceInstance:
             self.reactor.pause(self.reactor.monotonic() + 0.4)
             delta = _dist() - d0
             pushed += c
-            grace = SLOP * (2.0 if first else 1.0)
-            first = False
-            if delta > c * 2.0 + grace:
+            if delta < -0.5:
+                # Counter discontinuity: ACE_HUB_ENCODER RESET=1 (the hub-crossing anchor
+                # schedules one on a reactor callback, which runs inside our 0.4s pause) or a
+                # swallowed first read. Not a measurement - resync the ledger to neutral and
+                # restart the rolling window rather than raising STALLED/OVERRUN on garbage
+                # and poisoning the next three chunks (momus F4).
+                logging.warning("ace: %s slot %s chunk %.0f - encoder discontinuity "
+                                "(delta %.1f), resyncing, chunk not judged", what, slot, c, delta)
+                self.gcode.respond_info(
+                    f"ACE[{self.instance_num}]: {what} - encoder discontinuity on slot {slot}, "
+                    f"one {c:.0f}mm chunk ran unjudged (counter reset mid-push)")
+                delivered = pushed - SLOP
+                hist = []
+                continue
+            delivered += max(0.0, delta)
+            hist.append(round(delta, 1))
+            deficit = pushed - delivered - SLOP
+            logging.info("ace: %s slot %s chunk %.0f -> hub %.1f (cum %.1f/%.0f deficit %.1f)",
+                         what, slot, c, delta, delivered, pushed, max(0.0, deficit))
+            if delta > c * 2.0 + SLOP:
                 try:
+                    # _stop_rollback_assist early-returns when a rollback is tracked on a
+                    # DIFFERENT lane, and stopping that lane first costs a 1.0s blocking dwell
+                    # before the stop that matters (momus r2 f3: ~18mm more fold at bench
+                    # free-run rate). The tracked claim is stale bookkeeping, not hardware -
+                    # drop it in RAM so the stop for OUR lane takes the idx<0 send-anyway path
+                    # and goes on the wire FIRST.
+                    if 0 <= self._rollback_assist_index != slot:
+                        logging.warning("ace: dropping stale rollback claim on slot %s to "
+                                        "stop slot %s without delay",
+                                        self._rollback_assist_index, slot)
+                        self._rollback_assist_index = -1
                     self._stop_rollback_assist(slot)   # blind opcode-9 stop, needs no claim
                 except Exception:
                     logging.exception("ace: blind stop after overrun failed")
-                raise ValueError(
-                    f"ACE[{self.instance_num}]: {what} OVERRUN on slot {slot} - hub saw "
-                    f"{delta:.1f}mm for a {c:.0f}mm chunk. The ACE is free-running; assist "
-                    f"stopped blind. Check the hub for a fold before continuing.")
-            if delta < max(0.0, (c - grace)) * 0.4:
-                raise ValueError(
-                    f"ACE[{self.instance_num}]: {what} STARVED on slot {slot} - hub saw only "
-                    f"{delta:.1f}mm for a {c:.0f}mm chunk after {pushed - c:.0f}mm ok. The lane "
-                    f"is not paying out; stopping before the extruder grinds it. Verify assist "
-                    f"is actually delivering (device slot detail, not the flag) and retry.")
+                _fail("OVERRUN", f"hub saw {delta:.1f}mm for a {c:.0f}mm chunk - the ACE is "
+                                 f"free-running past the hub; a stop was ISSUED (verify the "
+                                 f"device went quiet before trusting it), check the hub for "
+                                 f"a fold")
+            if pushed - c > SLOP and delta < c * 0.7:
+                _fail("STALLED", f"hub saw only {delta:.1f}mm for a {c:.0f}mm chunk - the "
+                                 f"lane stopped paying out")
+            if len(hist) >= 4 and sum(hist[-3:]) / 3.0 < c * 0.8:
+                _fail("SLIPPING", f"last three chunks averaged "
+                                  f"{sum(hist[-3:]) / 3.0:.1f}mm of {c:.0f} - a steady bleed, "
+                                  f"the extruder is not fully gripping")
+            if deficit > MAX_DEFICIT:
+                _fail("SLIPPING", f"cumulative deficit {deficit:.1f}mm exceeds "
+                                  f"{MAX_DEFICIT:.0f}mm")
+        logging.info("ace: %s slot %s complete - %.1f/%.0fmm delivered, chunks %s",
+                     what, slot, delivered, pushed, hist)
 
     def unpark_to_nozzle(self, slot, target_temp=0):
         """Advance a PARKED tip from post-gear into the melt zone.
